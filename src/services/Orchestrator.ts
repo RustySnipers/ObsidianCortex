@@ -30,10 +30,25 @@ export default class Orchestrator {
     for (let step = 0; step < this.maxSteps; step++) {
       const toolDecision = await this.router.runToolCall(messages, this.tools.getSchemas());
       if (toolDecision.toolCalls?.length) {
+        const assistantToolMessage = {
+          role: 'assistant' as const,
+          content: toolDecision.text ?? null,
+          tool_calls: toolDecision.toolCalls.map((call, index) => ({
+            id: call.id ?? `call_${Date.now()}_${index}`,
+            type: 'function' as const,
+            function: {
+              name: call.name,
+              arguments: JSON.stringify(call.arguments ?? {}),
+            },
+          })),
+        } satisfies ILLMMessage;
+        messages.push(assistantToolMessage);
+
         for (const call of toolDecision.toolCalls) {
+          const toolCallId = call.id ?? assistantToolMessage.tool_calls?.find((c) => c.function.name === call.name)?.id ??
+            `call_${Date.now()}`;
           const result = await this.tools.runTool(call.name, call.arguments);
-          messages.push({ role: 'assistant', content: `Action ${call.name}: ${JSON.stringify(call.arguments)}`, tool_call_id: call.id });
-          messages.push({ role: 'tool', name: call.name, content: result.output, tool_call_id: call.id });
+          messages.push({ role: 'tool', name: call.name, content: result.output, tool_call_id: toolCallId });
         }
         messages.push({ role: 'user', content: 'Continue and incorporate the new observations. Include citations if relevant.' });
         continue;
