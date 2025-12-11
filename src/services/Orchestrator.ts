@@ -1,7 +1,7 @@
 import ToolsRegistry from '../tools/Tools';
 import ModelRouter from './ModelRouter';
 import VectorStore from './VectorStore';
-import { LLMMessage, VectorSearchResult } from '../types';
+import { ICortexSettings, LLMMessage, VectorSearchResult } from '../types';
 
 export default class Orchestrator {
   private maxSteps = 4;
@@ -9,7 +9,8 @@ export default class Orchestrator {
   constructor(
     private router: ModelRouter,
     private vectorStore: VectorStore,
-    private tools: ToolsRegistry
+    private tools: ToolsRegistry,
+    private settings?: ICortexSettings
   ) {}
 
   async run(query: string): Promise<string> {
@@ -26,7 +27,11 @@ export default class Orchestrator {
     ];
 
     for (let step = 0; step < this.maxSteps; step++) {
-      const toolDecision = await this.router.route('tools', { messages, tools: this.tools.getSchemas() });
+      const toolDecision = await this.router.route('tools', {
+        messages,
+        tools: this.tools.getSchemas(),
+        model: this.settings?.defaultToolModel,
+      });
       if (toolDecision.toolCalls?.length) {
         const assistantToolMessage = {
           role: 'assistant' as const,
@@ -58,20 +63,29 @@ export default class Orchestrator {
       break;
     }
 
-    const assistantResponse = await this.router.route('assistant', { messages, context: contextText });
+    const assistantResponse = await this.router.route('assistant', {
+      messages,
+      context: contextText,
+      model: this.settings?.defaultAssistantModel,
+    });
     if (assistantResponse.provider === 'claude' && assistantResponse.text) {
       return this.applyCitations(assistantResponse.text, searchResults);
     }
 
-    const deepResearch = await this.router.route('research', { messages, context: contextText });
+    const deepResearch = await this.router.route('research', {
+      messages,
+      context: contextText,
+      model: this.settings?.defaultResearchModel,
+    });
     return this.applyCitations(deepResearch.text, searchResults);
   }
 
   private buildContext(results: VectorSearchResult[]): string {
     return results
       .map((result) => {
-        const fileName = result.filePath.split('/').pop() ?? result.filePath;
-        return `[[${fileName}#^${result.blockId}]]\n${result.content}`;
+        const blockRef = result.blockRef ?? `^${result.blockId}`;
+        const citation = `[[${result.filePath}#${blockRef}]]`;
+        return `${citation}\n${result.content}`;
       })
       .join('\n\n');
   }
@@ -80,7 +94,10 @@ export default class Orchestrator {
     if (!results.length) return text;
     const citations = results
       .slice(0, 5)
-      .map((result) => `[[${(result.filePath.split('/').pop() ?? result.filePath)}#^${result.blockId}]]`)
+      .map((result) => {
+        const blockRef = result.blockRef ?? `^${result.blockId}`;
+        return `[[${result.filePath}#${blockRef}]]`;
+      })
       .join(' ');
     if (text.includes('[[')) return text;
     return `${text}\n\nSources: ${citations}`;

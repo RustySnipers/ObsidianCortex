@@ -34,6 +34,9 @@ const DEFAULT_SETTINGS: ICortexSettings = {
   defaultAssistantModel: 'claude-3-5-sonnet-20241022',
   defaultToolModel: 'gpt-4o-mini',
   defaultResearchModel: 'gemini-1.5-pro',
+  claudePromptCacheTtlMs: 5 * 60 * 1000,
+  geminiContextCacheTtlMs: 30 * 60 * 1000,
+  allowedCommandIds: [],
   autoIndex: true,
   persistIndex: true,
   indexFilePath: '.cortex-index.json',
@@ -153,8 +156,10 @@ export default class ObsidianCortexPlugin extends Plugin {
       await this.ensureStorage();
       return this.storage?.loadSecret(key) ?? null;
     };
-    this.modelRouter = new ModelRouter(loadSecret);
-    this.tools = new ToolsRegistry(this.app);
+    this.modelRouter = new ModelRouter(loadSecret, {
+      claudePromptCacheTtlMs: this.settings.claudePromptCacheTtlMs,
+      geminiContextCacheTtlMs: this.settings.geminiContextCacheTtlMs,
+    });
     const persistPath = this.settings.persistIndex ? this.settings.indexFilePath : '';
     this.vectorStore = new VectorStore(this.app, this, persistPath, {
       chunkTokenTarget: this.settings.chunkTokenTarget,
@@ -166,7 +171,8 @@ export default class ObsidianCortexPlugin extends Plugin {
     if (this.settings.autoIndex) {
       await this.vectorStore.initialize();
     }
-    this.orchestrator = new Orchestrator(this.modelRouter, this.vectorStore, this.tools);
+    this.tools = new ToolsRegistry(this.app, this.vectorStore, this.settings.allowedCommandIds ?? []);
+    this.orchestrator = new Orchestrator(this.modelRouter, this.vectorStore, this.tools, this.settings);
   }
 
   private createStorage(): SecretStorage {

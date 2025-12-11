@@ -16,6 +16,9 @@ export interface ICortexSettings {
   chunkTokenTarget?: number;
   chunkTokenOverlap?: number;
   hybridWeights?: { keyword: number; vector: number };
+  claudePromptCacheTtlMs?: number;
+  geminiContextCacheTtlMs?: number;
+  allowedCommandIds?: string[];
 }
 
 export interface ToolCall {
@@ -46,9 +49,9 @@ export interface ToolDefinition {
   name: string;
   description: string;
   schema: Record<string, unknown>;
-  safety?: {
+  guard?: {
     requiresActiveFile?: boolean;
-    confirm?: boolean;
+    allowedCommands?: string[];
   };
 }
 
@@ -59,8 +62,13 @@ export interface Tool extends ToolDefinition {
 export interface VectorSearchResult {
   content: string;
   filePath: string;
+  heading?: string;
   blockId: string;
-  score: number;
+  blockRef?: string;
+  vectorScore?: number;
+  keywordScore?: number;
+  combinedScore: number;
+  score?: number;
   highlights?: string[];
 }
 
