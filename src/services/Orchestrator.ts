@@ -1,7 +1,7 @@
 import ToolsRegistry from '../tools/Tools';
 import ModelRouter from './ModelRouter';
 import VectorStore from './VectorStore';
-import { ILLMMessage, ISearchResult } from '../types';
+import { LLMMessage, VectorSearchResult } from '../types';
 
 export default class Orchestrator {
   private maxSteps = 4;
@@ -15,20 +15,18 @@ export default class Orchestrator {
   async run(query: string): Promise<string> {
     const searchResults = await this.vectorStore.search(query, 6);
     const contextText = this.buildContext(searchResults);
-    const messages: ILLMMessage[] = [
+    const messages: LLMMessage[] = [
       {
         role: 'system',
         content:
           'You are Obsidian Cortex. Use ReAct: think, decide on a tool, observe results, and answer with concise steps. Always cite snippets using [[File#^block]] based on provided context. Only cite provided blockIds.',
       },
-      {
-        role: 'user',
-        content: `${query}\n\nContext:\n${contextText || 'No matching notes found.'}`,
-      },
+      { role: 'user', content: query },
+      { role: 'system', content: `Context:\n${contextText || 'No matching notes found.'}` },
     ];
 
     for (let step = 0; step < this.maxSteps; step++) {
-      const toolDecision = await this.router.runToolCall(messages, this.tools.getSchemas());
+      const toolDecision = await this.router.route('tools', { messages, tools: this.tools.getSchemas() });
       if (toolDecision.toolCalls?.length) {
         const assistantToolMessage = {
           role: 'assistant' as const,
@@ -41,31 +39,35 @@ export default class Orchestrator {
               arguments: JSON.stringify(call.arguments ?? {}),
             },
           })),
-        } satisfies ILLMMessage;
+        } satisfies LLMMessage;
         messages.push(assistantToolMessage);
 
         for (const call of toolDecision.toolCalls) {
-          const toolCallId = call.id ?? assistantToolMessage.tool_calls?.find((c) => c.function.name === call.name)?.id ??
+          const toolCallId = call.id ??
+            assistantToolMessage.tool_calls?.find((c) => c.function.name === call.name)?.id ??
             `call_${Date.now()}`;
           const result = await this.tools.runTool(call.name, call.arguments);
           messages.push({ role: 'tool', name: call.name, content: result.output, tool_call_id: toolCallId });
         }
-        messages.push({ role: 'user', content: 'Continue and incorporate the new observations. Include citations if relevant.' });
+        messages.push({
+          role: 'user',
+          content: 'Continue reasoning with the new observations. Include citations where relevant.',
+        });
         continue;
       }
       break;
     }
 
-    const assistantResponse = await this.router.runAssistant(query, contextText, messages);
+    const assistantResponse = await this.router.route('assistant', { messages, context: contextText });
     if (assistantResponse.text) {
       return this.applyCitations(assistantResponse.text, searchResults);
     }
 
-    const deepResearch = await this.router.runDeepResearch(query, contextText, messages);
+    const deepResearch = await this.router.route('research', { messages, context: contextText });
     return this.applyCitations(deepResearch.text, searchResults);
   }
 
-  private buildContext(results: ISearchResult[]): string {
+  private buildContext(results: VectorSearchResult[]): string {
     return results
       .map((result) => {
         const fileName = result.filePath.split('/').pop() ?? result.filePath;
@@ -74,7 +76,7 @@ export default class Orchestrator {
       .join('\n\n');
   }
 
-  private applyCitations(text: string, results: ISearchResult[]): string {
+  private applyCitations(text: string, results: VectorSearchResult[]): string {
     if (!results.length) return text;
     const citations = results
       .slice(0, 5)

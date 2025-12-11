@@ -1,4 +1,4 @@
-import { App, MarkdownView, TFile } from 'obsidian';
+import { App, MarkdownView, TAbstractFile, TFile, TFolder } from 'obsidian';
 import { ITool, IToolDefinition, IToolResult } from '../types';
 
 export default class ToolsRegistry {
@@ -22,35 +22,45 @@ export default class ToolsRegistry {
 
   private createNotesTool(): ITool {
     return {
-      name: 'Notes',
-      description: 'Create or overwrite a markdown note with provided content.',
+      name: 'notes',
+      description: 'List notes in a folder or read the contents of a specific note.',
       schema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: "Full path for the note, e.g., 'Projects/Idea.md'" },
-          content: { type: 'string', description: 'Markdown content to write into the file.' },
+          action: { type: 'string', enum: ['list', 'read'], description: 'Choose list or read.' },
+          path: { type: 'string', description: "Folder or file path, e.g., 'Projects' or 'Projects/Idea.md'." },
         },
-        required: ['path', 'content'],
+        required: ['action'],
       },
       handler: async (args: Record<string, any>): Promise<IToolResult> => {
+        const action = (args.action ?? 'list') as 'list' | 'read';
         const path = String(args.path ?? '').trim();
-        const content = String(args.content ?? '');
+        if (action === 'list') {
+          const folder = path ? this.app.vault.getAbstractFileByPath(path) : this.app.vault.getRoot();
+          if (!(folder instanceof TFolder)) {
+            return { name: 'notes', success: false, output: 'Provide a valid folder to list notes.' };
+          }
+          const items = folder.children.filter(
+            (child: TAbstractFile): child is TFile => child instanceof TFile && child.extension === 'md'
+          );
+          const summary = items.map((item: TFile) => item.path).join('\n');
+          return { name: 'notes', success: true, output: summary || 'No markdown files found.' };
+        }
+
         if (!path) {
-          return { name: 'Notes', success: false, output: 'A valid path is required.' };
+          return { name: 'notes', success: false, output: 'A file path is required to read a note.' };
         }
         const normalized = path.endsWith('.md') ? path : `${path}.md`;
+        const file = this.app.vault.getAbstractFileByPath(normalized);
+        if (!(file instanceof TFile)) {
+          return { name: 'notes', success: false, output: `No file found at ${normalized}.` };
+        }
         try {
-          const existing = this.app.vault.getAbstractFileByPath(normalized);
-          if (existing instanceof TFile) {
-            await this.app.vault.process(existing, () => content);
-            return { name: 'Notes', success: true, output: `Updated ${normalized}` };
-          }
-          await this.ensureFolders(normalized);
-          await this.app.vault.create(normalized, content);
-          return { name: 'Notes', success: true, output: `Created ${normalized}` };
+          const content = await this.app.vault.cachedRead(file);
+          return { name: 'notes', success: true, output: content };
         } catch (error) {
-          console.error('Failed to write note', error);
-          return { name: 'Notes', success: false, output: 'Unable to write the note.' };
+          console.error('Failed to read note', error);
+          return { name: 'notes', success: false, output: 'Unable to read the note.' };
         }
       },
     };
@@ -59,37 +69,38 @@ export default class ToolsRegistry {
   private createExecuteCommandTool(): ITool {
     return {
       name: 'execute_command',
-      description: 'Execute an Obsidian command by ID with Markdown view safety checks.',
+      description: 'Execute an Obsidian command by ID with optional active file safety checks.',
       schema: {
         type: 'object',
         properties: {
-          command_id: { type: 'string', description: "Command ID, e.g., 'editor:toggle-bold'" },
+          commandId: { type: 'string', description: "Command ID, e.g., 'editor:toggle-bold'" },
+          args: { type: 'object', description: 'Optional arguments for the command.', additionalProperties: true },
+          requiresActiveFile: {
+            type: 'boolean',
+            description: 'If true, ensure there is an active Markdown file before executing.',
+          },
         },
-        required: ['command_id'],
+        required: ['commandId'],
       },
       handler: async (args: Record<string, any>): Promise<IToolResult> => {
-        const commandId = String(args.command_id ?? '').trim();
+        const commandId = String(args.commandId ?? '').trim();
+        const requiresActiveFile = Boolean(args.requiresActiveFile);
         if (!commandId) {
-          return { name: 'execute_command', success: false, output: 'command_id is required.' };
+          return { name: 'execute_command', success: false, output: 'commandId is required.' };
         }
         const commandsApi = (this.app as any).commands;
         const command = commandsApi?.listCommands?.()?.find((entry: any) => entry.id === commandId);
         if (!command) {
           return { name: 'execute_command', success: false, output: `Command ${commandId} not found.` };
         }
-        const requiresEditor = Boolean(command.editorCallback || command.editorCheckCallback);
-        if (requiresEditor) {
+        if (requiresActiveFile) {
           const view = this.app.workspace.getActiveViewOfType(MarkdownView);
           if (!view) {
-            return {
-              name: 'execute_command',
-              success: false,
-              output: 'This command requires an active Markdown editor.',
-            };
+            return { name: 'execute_command', success: false, output: 'This command requires an active Markdown editor.' };
           }
         }
         try {
-          commandsApi?.executeCommandById?.(commandId);
+          commandsApi?.executeCommandById?.(commandId, args.args ?? {});
           return { name: 'execute_command', success: true, output: `Executed ${commandId}.` };
         } catch (error) {
           console.error('Failed to execute command', error);
@@ -106,24 +117,28 @@ export default class ToolsRegistry {
       schema: {
         type: 'object',
         properties: {
-          current_path: { type: 'string', description: 'Existing path to the note.' },
-          new_path: { type: 'string', description: 'Destination path for the note.' },
+          sourcePath: { type: 'string', description: 'Existing path to the note.' },
+          targetFolder: { type: 'string', description: 'Destination folder for the note.' },
+          newName: { type: 'string', description: 'Optional new file name (without extension).' },
         },
-        required: ['current_path', 'new_path'],
+        required: ['sourcePath', 'targetFolder'],
       },
       handler: async (args: Record<string, any>): Promise<IToolResult> => {
-        const currentPath = String(args.current_path ?? '').trim();
-        const newPath = String(args.new_path ?? '').trim();
-        if (!currentPath || !newPath) {
-          return { name: 'organize_note', success: false, output: 'Both current_path and new_path are required.' };
+        const sourcePath = String(args.sourcePath ?? '').trim();
+        const targetFolder = String(args.targetFolder ?? '').trim();
+        const newName = String(args.newName ?? '').trim();
+        if (!sourcePath || !targetFolder) {
+          return { name: 'organize_note', success: false, output: 'Both sourcePath and targetFolder are required.' };
         }
-        const file = this.app.vault.getAbstractFileByPath(currentPath);
+        const file = this.app.vault.getAbstractFileByPath(sourcePath);
         if (!(file instanceof TFile)) {
-          return { name: 'organize_note', success: false, output: `No file found at ${currentPath}.` };
+          return { name: 'organize_note', success: false, output: `No file found at ${sourcePath}.` };
         }
-        const normalized = newPath.endsWith('.md') ? newPath : `${newPath}.md`;
+        const destinationFolder = targetFolder.replace(/\/$/, '');
+        const fileName = newName || file.name.replace(/\.md$/, '');
+        const normalized = `${destinationFolder}/${fileName.endsWith('.md') ? fileName : `${fileName}.md`}`;
         try {
-          await this.ensureFolders(normalized);
+          await this.ensureFolders(destinationFolder);
           await this.app.fileManager.renameFile(file, normalized);
           return { name: 'organize_note', success: true, output: `Moved note to ${normalized}.` };
         } catch (error) {

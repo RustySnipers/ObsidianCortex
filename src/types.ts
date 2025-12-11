@@ -1,6 +1,4 @@
-import { App, TFile } from 'obsidian';
-
-export type ModelProvider = 'gemini-pro' | 'claude-sonnet' | 'gpt-4o';
+export type ModelProvider = 'gemini' | 'claude' | 'openai';
 
 export interface ICortexSettings {
   salt: string;
@@ -13,52 +11,57 @@ export interface ICortexSettings {
   autoIndex: boolean;
   persistIndex: boolean;
   indexFilePath: string;
+  embeddingDimensions?: number;
+  maxChunksPerFile?: number;
+  chunkTokenTarget?: number;
+  chunkTokenOverlap?: number;
+  hybridWeights?: { keyword: number; vector: number };
 }
 
-export interface ILLMMessage {
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface LLMMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
   name?: string;
   tool_call_id?: string;
-  tool_calls?: {
-    id: string;
-    type: 'function';
-    function: {
-      name: string;
-      arguments: string;
-    };
-  }[];
+  tool_calls?: ToolCall[];
 }
 
-export interface IToolResult {
+export interface ToolCallResult {
   name: string;
   success: boolean;
   output: string;
-  data?: any;
+  data?: unknown;
 }
 
-export interface IToolDefinition {
+export interface ToolDefinition {
   name: string;
   description: string;
-  schema: Record<string, any>;
+  schema: Record<string, unknown>;
+  safety?: {
+    requiresActiveFile?: boolean;
+    confirm?: boolean;
+  };
 }
 
-export interface ITool extends IToolDefinition {
-  handler: (args: Record<string, any>) => Promise<IToolResult>;
+export interface Tool extends ToolDefinition {
+  handler: (args: Record<string, any>) => Promise<ToolCallResult>;
 }
 
-export interface ISearchResult {
+export interface VectorSearchResult {
   content: string;
   filePath: string;
   blockId: string;
   score: number;
   highlights?: string[];
-}
-
-export interface IVectorIndexBinding {
-  app: App;
-  file: TFile;
-  content: string;
 }
 
 export type SecretLoader = (key: string) => Promise<string | null>;
@@ -75,3 +78,10 @@ export interface ReActStep {
   action?: string;
   observation?: string;
 }
+
+// Backwards compatibility exports for existing imports
+export type ILLMMessage = LLMMessage;
+export type IToolResult = ToolCallResult;
+export type IToolDefinition = ToolDefinition;
+export type ITool = Tool;
+export type ISearchResult = VectorSearchResult;
