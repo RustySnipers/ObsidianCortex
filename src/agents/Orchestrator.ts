@@ -16,7 +16,7 @@ export default class Orchestrator {
       .map((result) => `- (${result.chunk.filePath}#${result.chunk.blockId}) ${result.chunk.content}`)
       .join('\n');
 
-    const messages: ModelMessage[] = [
+    const baseMessages: ModelMessage[] = [
       {
         role: 'system',
         content:
@@ -28,29 +28,37 @@ export default class Orchestrator {
       },
     ];
 
-    let finalResponse = '';
+    let workingMessages = [...baseMessages];
     for (let step = 0; step < 3; step++) {
-      const response = await this.router.complete({
+      const execution = await this.router.complete({
         task: 'execute',
         prompt: query,
-        messages,
+        messages: workingMessages,
         tools: this.tools.getDefinitions(),
       });
-      finalResponse = response.text;
-      if (response.toolCalls && response.toolCalls.length) {
-        for (const call of response.toolCalls) {
+
+      if (execution.toolCalls && execution.toolCalls.length) {
+        for (const call of execution.toolCalls) {
           const result = await this.tools.runTool(call.name, call.arguments);
-          messages.push({
+          workingMessages.push({
             role: 'assistant',
-            content: `Tool ${result.name} responded (${result.success ? 'success' : 'failure'}): ${result.output}`,
+            content: `Observation: ${result.output}`,
           });
         }
-        messages.push({ role: 'user', content: 'Continue after executing the tool and return the final answer.' });
+        workingMessages.push({ role: 'user', content: 'Continue with updated state and provide the next step.' });
         continue;
       }
-      break;
+
+      const research = await this.router.complete({
+        task: 'research',
+        prompt: query,
+        context: contextText,
+        messages: workingMessages,
+      });
+      return research.text;
     }
 
-    return finalResponse;
+    const fallback = await this.router.complete({ task: 'chat', prompt: query, context: contextText });
+    return fallback.text;
   }
 }

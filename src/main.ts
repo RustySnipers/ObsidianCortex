@@ -136,12 +136,13 @@ export default class ObsidianCortexPlugin extends Plugin {
   }
 
   private async initializeCognitiveEngine(): Promise<void> {
-    this.modelRouter = new ModelRouter(async (key) => {
+    const loadSecret = async (key: string) => {
       await this.ensureStorage();
       return this.storage?.loadSecret(key) ?? null;
-    });
+    };
+    this.modelRouter = new ModelRouter(loadSecret);
     this.tools = new ToolDefinitions(this.app);
-    this.vectorStore = new VectorStore(this.app, this);
+    this.vectorStore = new VectorStore(this.app, this, loadSecret);
     await this.vectorStore.initialize();
     this.orchestrator = new Orchestrator(this.modelRouter, this.vectorStore, this.tools);
   }

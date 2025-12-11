@@ -2,6 +2,8 @@ import { App, TFile } from 'obsidian';
 
 export type CortexTask = 'research' | 'chat' | 'execute';
 
+export type ModelProvider = 'gemini-pro' | 'claude-sonnet' | 'gpt-4o';
+
 export interface ModelMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
@@ -24,6 +26,7 @@ export interface ModelResponse {
   text: string;
   toolCalls?: ToolCall[];
   metadata?: Record<string, any>;
+  provider?: ModelProvider;
 }
 
 export interface ToolExecutionResult {
@@ -38,6 +41,8 @@ export interface ToolSchema {
   description: string;
   parameters: Record<string, any>;
 }
+
+export type EmbeddingProvider = 'openai' | 'transformers' | 'local-fallback';
 
 export interface CortexChunk {
   id: string;

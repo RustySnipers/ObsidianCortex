@@ -25,6 +25,24 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
       required: ['command_id'],
     },
   },
+  {
+    name: 'organize_note',
+    description: 'Move or rename a markdown note while preserving wikilinks.',
+    parameters: {
+      type: 'object',
+      properties: {
+        current_path: {
+          type: 'string',
+          description: "Existing path to the note (e.g., 'Projects/Alpha.md')",
+        },
+        new_path: {
+          type: 'string',
+          description: "Target path for the renamed note (e.g., 'Projects/Archive/Alpha.md')",
+        },
+      },
+      required: ['current_path', 'new_path'],
+    },
+  },
 ];
 
 export default class ToolDefinitions {
@@ -40,6 +58,8 @@ export default class ToolDefinitions {
         return this.createNote(args);
       case 'execute_command':
         return this.executeCommand(args);
+      case 'organize_note':
+        return this.organizeNote(args);
       default:
         return { name, success: false, output: `Tool ${name} is not implemented.` };
     }
@@ -86,7 +106,7 @@ export default class ToolDefinitions {
       return { name: 'execute_command', success: false, output: 'A command_id is required.' };
     }
     const commandsApi = (this.app as any).commands;
-    const command = commandsApi?.findCommand?.(commandId);
+    const command = commandsApi?.listCommands?.()?.find((entry: any) => entry.id === commandId);
     if (!command) {
       return { name: 'execute_command', success: false, output: `Command ${commandId} not found.` };
     }
@@ -107,6 +127,27 @@ export default class ToolDefinitions {
     } catch (error) {
       console.error('Failed to execute command', error);
       return { name: 'execute_command', success: false, output: 'Command execution failed.' };
+    }
+  }
+
+  private async organizeNote(args: Record<string, any>): Promise<ToolExecutionResult> {
+    const currentPath = String(args.current_path ?? '').trim();
+    const newPath = String(args.new_path ?? '').trim();
+    if (!currentPath || !newPath) {
+      return { name: 'organize_note', success: false, output: 'Both current_path and new_path are required.' };
+    }
+    const currentFile = this.app.vault.getAbstractFileByPath(currentPath);
+    if (!(currentFile instanceof TFile)) {
+      return { name: 'organize_note', success: false, output: `No file found at ${currentPath}.` };
+    }
+    const normalizedTarget = newPath.endsWith('.md') ? newPath : `${newPath}.md`;
+    try {
+      await this.ensureFolders(normalizedTarget);
+      await this.app.fileManager.renameFile(currentFile, normalizedTarget);
+      return { name: 'organize_note', success: true, output: `Moved note to ${normalizedTarget}.` };
+    } catch (error) {
+      console.error('Failed to organize note', error);
+      return { name: 'organize_note', success: false, output: 'Unable to move or rename the note.' };
     }
   }
 }
