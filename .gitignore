@@ -2,4 +2,6 @@ node_modules
 .DS_Store
 obsidian-cortex.zip
 main.js
+src/**/*.js
+src/**/*.js.map
 *.map

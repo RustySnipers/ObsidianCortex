@@ -7,6 +7,10 @@ import {
   PluginSettingTab,
   Setting,
 } from 'obsidian';
+import Orchestrator from './agents/Orchestrator';
+import ModelRouter from './services/ModelRouter';
+import VectorStore from './services/VectorStore';
+import ToolDefinitions from './tools/ToolDefinitions';
 
 interface CortexSettings {
   salt: string;
@@ -34,7 +38,11 @@ type ElectronSafeStorage = {
 };
 
 class DesktopSafeSecretStorage implements SecretStorage {
-  constructor(private manifest: PluginManifest, private persist: (data: Record<string, string>) => Promise<void>, private snapshot: () => Record<string, string>) {}
+  private pluginId: string;
+
+  constructor(manifest: PluginManifest, private persist: (data: Record<string, string>) => Promise<void>, private snapshot: () => Record<string, string>) {
+    this.pluginId = manifest.id;
+  }
 
   private get electronSafeStorage(): ElectronSafeStorage | null {
     const loader = (window as unknown as { require?: (module: string) => any }).require;
@@ -50,10 +58,11 @@ class DesktopSafeSecretStorage implements SecretStorage {
 
   async saveSecret(key: string, value: string): Promise<void> {
     const safeStorage = this.electronSafeStorage;
-    if (!safeStorage) throw new Error('Desktop secure storage is unavailable.');
+    if (!safeStorage) throw new Error(`${this.pluginId}: Desktop secure storage is unavailable.`);
     const encrypted = safeStorage.encryptString(value);
     const secrets = this.snapshot();
-    secrets[key] = arrayBufferToBase64(encrypted.buffer);
+    const payload = new Uint8Array(encrypted);
+    secrets[key] = arrayBufferToBase64(payload.buffer);
     await this.persist(secrets);
   }
 
@@ -108,17 +117,33 @@ class LocalEncryptedStorage implements SecretStorage {
 export default class ObsidianCortexPlugin extends Plugin {
   settings: CortexSettings = DEFAULT_SETTINGS;
   private storage: SecretStorage | null = null;
+  private modelRouter: ModelRouter | null = null;
+  private vectorStore: VectorStore | null = null;
+  private tools: ToolDefinitions | null = null;
+  private orchestrator: Orchestrator | null = null;
 
   async onload(): Promise<void> {
     console.log('Obsidian Cortex Architect initialized. Ready to implement the Agentic OS.');
     await this.loadSettings();
     this.storage = this.createStorage();
+    await this.initializeCognitiveEngine();
     this.registerCommands();
     this.addSettingTab(new CortexSettingTab(this.app, this));
   }
 
   onunload(): void {
     console.log('Unloading Obsidian Cortex');
+  }
+
+  private async initializeCognitiveEngine(): Promise<void> {
+    this.modelRouter = new ModelRouter(async (key) => {
+      await this.ensureStorage();
+      return this.storage?.loadSecret(key) ?? null;
+    });
+    this.tools = new ToolDefinitions(this.app);
+    this.vectorStore = new VectorStore(this.app, this);
+    await this.vectorStore.initialize();
+    this.orchestrator = new Orchestrator(this.modelRouter, this.vectorStore, this.tools);
   }
 
   private createStorage(): SecretStorage {
@@ -136,6 +161,11 @@ export default class ObsidianCortexPlugin extends Plugin {
       }
     }
     return new LocalEncryptedStorage(() => this.settings);
+  }
+
+  updateStorageProvider(preferred: CortexSettings['preferredStorage']): void {
+    this.settings.preferredStorage = preferred;
+    this.storage = this.createStorage();
   }
 
   private registerCommands(): void {
@@ -165,11 +195,31 @@ export default class ObsidianCortexPlugin extends Plugin {
         console.log('OpenAI API key', secret);
       },
     });
+
+    this.addCommand({
+      id: 'obsidian-cortex-ask',
+      name: 'Ask Obsidian Cortex (Agentic)',
+      callback: async () => {
+        const prompt = await this.promptForInput('What would you like Obsidian Cortex to handle?', false);
+        if (!prompt) return;
+        if (!this.orchestrator) {
+          new Notice('The cognitive engine is still loading. Please try again.');
+          return;
+        }
+        const response = await this.orchestrator.run(prompt);
+        new Notice('Cortex responded. Check the console for details.');
+        console.log('Cortex response', response);
+      },
+    });
   }
 
   private async promptForSecret(placeholder: string): Promise<string | null> {
+    return this.promptForInput(placeholder, true);
+  }
+
+  private async promptForInput(placeholder: string, masked: boolean): Promise<string | null> {
     return new Promise((resolve) => {
-      const modal = new PromptModal(this.app, placeholder, resolve);
+      const modal = new PromptModal(this.app, placeholder, resolve, masked ? 'password' : 'text');
       modal.open();
     });
   }
@@ -209,8 +259,7 @@ class CortexSettingTab extends PluginSettingTab {
           .addOption('localStorage', 'Local encrypted storage')
           .setValue(this.plugin.settings.preferredStorage)
           .onChange(async (value) => {
-            this.plugin.settings.preferredStorage = value as CortexSettings['preferredStorage'];
-            this.plugin.storage = this.plugin.createStorage();
+            this.plugin.updateStorageProvider(value as CortexSettings['preferredStorage']);
             await this.plugin.saveSettings();
           });
       });
@@ -246,17 +295,19 @@ class CortexSettingTab extends PluginSettingTab {
 class PromptModal extends Modal {
   private resolve: (value: string | null) => void;
   private placeholder: string;
+  private inputType: 'text' | 'password';
 
-  constructor(app: App, placeholder: string, resolve: (value: string | null) => void) {
+  constructor(app: App, placeholder: string, resolve: (value: string | null) => void, inputType: 'text' | 'password' = 'password') {
     super(app);
     this.resolve = resolve;
     this.placeholder = placeholder;
+    this.inputType = inputType;
   }
 
   onOpen(): void {
     const { contentEl } = this;
     contentEl.createEl('h3', { text: this.placeholder });
-    const input = contentEl.createEl('input', { type: 'password' });
+    const input = contentEl.createEl('input', { type: this.inputType });
     input.placeholder = this.placeholder;
     input.addEventListener('keydown', (event: KeyboardEvent) => {
       if (event.key === 'Enter') {

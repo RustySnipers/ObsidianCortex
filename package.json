@@ -7,6 +7,9 @@
     "build": "tsc -noEmit false",
     "dev": "tsc --watch"
   },
+  "dependencies": {
+    "@orama/orama": "^1.4.2"
+  },
   "devDependencies": {
     "obsidian": "latest",
     "tslib": "^2.6.2",
