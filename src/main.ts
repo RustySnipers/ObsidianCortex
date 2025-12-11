@@ -37,6 +37,11 @@ const DEFAULT_SETTINGS: ICortexSettings = {
   autoIndex: true,
   persistIndex: true,
   indexFilePath: '.cortex-index.json',
+  embeddingDimensions: 384,
+  maxChunksPerFile: 64,
+  chunkTokenTarget: 240,
+  chunkTokenOverlap: 40,
+  hybridWeights: { keyword: 0.55, vector: 0.45 },
 };
 
 class DesktopSafeSecretStorage implements SecretStorage {
@@ -122,7 +127,7 @@ class LocalEncryptedStorage implements SecretStorage {
 
 export default class ObsidianCortexPlugin extends Plugin {
   settings: ICortexSettings = DEFAULT_SETTINGS;
-  private storage: SecretStorage | null = null;
+  public storage: SecretStorage | null = null;
   private modelRouter: ModelRouter | null = null;
   private vectorStore: VectorStore | null = null;
   private tools: ToolsRegistry | null = null;
@@ -135,7 +140,7 @@ export default class ObsidianCortexPlugin extends Plugin {
     await this.initializeCognitiveEngine();
     this.registerCommands();
     this.addSettingTab(new CortexSettingTab(this.app, this));
-    this.registerView(CortexChatView.VIEW_TYPE, (leaf) => new CortexChatView(leaf));
+    this.registerView(CortexChatView.VIEW_TYPE, (leaf: any) => new CortexChatView(leaf));
     this.addRibbonIcon('bot', 'Open Cortex Chat', async () => this.activateCortexChat());
   }
 
@@ -151,7 +156,13 @@ export default class ObsidianCortexPlugin extends Plugin {
     this.modelRouter = new ModelRouter(loadSecret);
     this.tools = new ToolsRegistry(this.app);
     const persistPath = this.settings.persistIndex ? this.settings.indexFilePath : '';
-    this.vectorStore = new VectorStore(this.app, this, loadSecret, persistPath);
+    this.vectorStore = new VectorStore(this.app, this, persistPath, {
+      chunkTokenTarget: this.settings.chunkTokenTarget,
+      chunkTokenOverlap: this.settings.chunkTokenOverlap,
+      maxChunksPerFile: this.settings.maxChunksPerFile,
+      hybridWeights: this.settings.hybridWeights,
+      embeddingDimensions: this.settings.embeddingDimensions,
+    });
     if (this.settings.autoIndex) {
       await this.vectorStore.initialize();
     }
@@ -230,7 +241,7 @@ export default class ObsidianCortexPlugin extends Plugin {
     }
   }
 
-  private async storeSecret(key: string, value: string): Promise<void> {
+  public async storeSecret(key: string, value: string): Promise<void> {
     if (!value.trim()) return;
     await this.ensureStorage();
     await this.storage?.saveSecret(key, value.trim());
@@ -259,8 +270,8 @@ class CortexChatView extends ItemView {
   }
 
   async onOpen(): Promise<void> {
-    this.containerEl.empty();
-    this.containerEl.createEl('div', { text: 'Cortex Chat UI coming soon.' });
+    (this.containerEl as any).empty();
+    (this.containerEl as any).createEl('div', { text: 'Cortex Chat UI coming soon.' });
   }
 }
 
@@ -271,8 +282,8 @@ class CortexSettingTab extends PluginSettingTab {
 
   async display(): Promise<void> {
     const { containerEl } = this;
-    containerEl.empty();
-    containerEl.createEl('h2', { text: 'Obsidian Cortex — Security & Models' });
+    (containerEl as any).empty();
+    (containerEl as any).createEl('h2', { text: 'Obsidian Cortex — Security & Models' });
 
     await this.plugin.ensureStorage();
     const openaiPresent = (await this.plugin.storage?.loadSecret('openai')) ? 'Stored' : 'Not set';
@@ -282,12 +293,12 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Preferred storage provider')
       .setDesc('Use OS-level safeStorage on desktop or a passphrase-protected localStorage fallback for mobile.')
-      .addDropdown((dropdown) => {
+      .addDropdown((dropdown: any) => {
         dropdown
           .addOption('safeStorage', 'Desktop safeStorage')
           .addOption('localStorage', 'Local encrypted storage')
           .setValue(this.plugin.settings.preferredStorage)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.updateStorageProvider(value as ICortexSettings['preferredStorage']);
             await this.plugin.saveSettings();
           });
@@ -296,11 +307,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Passphrase')
       .setDesc('Used for deriving encryption keys when localStorage is selected. Stored in plugin data; choose a strong passphrase.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('Enter passphrase')
           .setValue(this.plugin.settings.passphrase)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.passphrase = value;
             await this.plugin.saveSettings();
           })
@@ -309,11 +320,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Salt')
       .setDesc('Additional salt for deriving local encryption keys. Stored in plugin data.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('Enter salt value')
           .setValue(this.plugin.settings.salt)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.salt = value;
             await this.plugin.saveSettings();
           })
@@ -322,10 +333,10 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('OpenAI API Key')
       .setDesc(`Status: ${openaiPresent}`)
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('sk-...')
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             await this.plugin.storeSecret('openai', value);
           })
       );
@@ -333,10 +344,10 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Gemini API Key')
       .setDesc(`Status: ${geminiPresent}`)
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('AIza...')
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             await this.plugin.storeSecret('gemini', value);
           })
       );
@@ -344,10 +355,10 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Anthropic API Key')
       .setDesc(`Status: ${anthropicPresent}`)
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('sk-ant-...')
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             await this.plugin.storeSecret('anthropic', value);
           })
       );
@@ -355,11 +366,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Assistant model (Claude)')
       .setDesc('Model used for the assistant persona.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.defaultAssistantModel)
           .setValue(this.plugin.settings.defaultAssistantModel)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.defaultAssistantModel = value || DEFAULT_SETTINGS.defaultAssistantModel;
             await this.plugin.saveSettings();
           })
@@ -368,11 +379,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Tool model (GPT-4o)')
       .setDesc('Model used for function calling and tool routing.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.defaultToolModel)
           .setValue(this.plugin.settings.defaultToolModel)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.defaultToolModel = value || DEFAULT_SETTINGS.defaultToolModel;
             await this.plugin.saveSettings();
           })
@@ -381,11 +392,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Research model (Gemini)')
       .setDesc('Model used for deep research with cached context.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder(DEFAULT_SETTINGS.defaultResearchModel)
           .setValue(this.plugin.settings.defaultResearchModel)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.defaultResearchModel = value || DEFAULT_SETTINGS.defaultResearchModel;
             await this.plugin.saveSettings();
           })
@@ -394,8 +405,8 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Auto-index vault')
       .setDesc('Automatically index notes on startup and when they change.')
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
+      .addToggle((toggle: any) =>
+        toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value: any) => {
           this.plugin.settings.autoIndex = value;
           await this.plugin.saveSettings();
         })
@@ -404,8 +415,8 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Persist index to vault')
       .setDesc('Store the index JSON in the vault for faster reloads.')
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.persistIndex).onChange(async (value) => {
+      .addToggle((toggle: any) =>
+        toggle.setValue(this.plugin.settings.persistIndex).onChange(async (value: any) => {
           this.plugin.settings.persistIndex = value;
           await this.plugin.saveSettings();
         })
@@ -414,11 +425,11 @@ class CortexSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Index file path')
       .setDesc('Relative path inside the vault for storing the index JSON.')
-      .addText((text) =>
+      .addText((text: any) =>
         text
           .setPlaceholder('.cortex-index.json')
           .setValue(this.plugin.settings.indexFilePath)
-          .onChange(async (value) => {
+          .onChange(async (value: any) => {
             this.plugin.settings.indexFilePath = value || DEFAULT_SETTINGS.indexFilePath;
             await this.plugin.saveSettings();
           })
@@ -439,20 +450,20 @@ class PromptModal extends Modal {
   }
 
   onOpen(): void {
-    const { contentEl } = this;
+    const { contentEl } = this as any;
+    const inputEl = contentEl.createEl('input', { type: this.inputType });
     contentEl.createEl('h3', { text: this.placeholder });
-    const input = contentEl.createEl('input', { type: this.inputType });
-    input.placeholder = this.placeholder;
-    input.addEventListener('keydown', (event: KeyboardEvent) => {
+    inputEl.placeholder = this.placeholder;
+    inputEl.addEventListener('keydown', (event: KeyboardEvent) => {
       if (event.key === 'Enter') {
-        this.resolve(input.value || null);
+        this.resolve((inputEl as any).value || null);
         this.close();
       }
     });
   }
 
   onClose(): void {
-    this.contentEl.empty();
+    (this.contentEl as any).empty();
   }
 }
 

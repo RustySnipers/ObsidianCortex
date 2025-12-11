@@ -1,5 +1,7 @@
 import { App, Plugin, TAbstractFile, TFile } from 'obsidian';
-import { ISearchResult, SecretLoader } from '../types';
+import { VectorSearchResult } from '../types';
+
+type OramaModule = typeof import('@orama/orama');
 
 interface IndexedChunk {
   id: string;
@@ -7,20 +9,34 @@ interface IndexedChunk {
   filePath: string;
   blockId: string;
   embedding: number[];
+  keywords: string[];
 }
 
 interface FallbackIndex {
   chunks: Map<string, IndexedChunk>;
 }
 
+interface RagOptions {
+  chunkTokenTarget?: number;
+  chunkTokenOverlap?: number;
+  maxChunksPerFile?: number;
+  hybridWeights?: { keyword: number; vector: number };
+  embeddingDimensions?: number;
+}
+
 export default class VectorStore {
   private db: any | FallbackIndex | null = null;
-  private orama: any | null = null;
+  private orama: OramaModule | null = null;
   private bindings = new Map<string, string[]>();
   private cachedChunks = new Map<string, IndexedChunk>();
   private loading = false;
 
-  constructor(private app: App, private plugin: Plugin, private loadSecret: SecretLoader, private persistPath = '.cortex-index.json') {}
+  constructor(
+    private app: App,
+    private plugin: Plugin,
+    private persistPath = '.cortex-index.json',
+    private options: RagOptions = {}
+  ) {}
 
   async initialize(): Promise<void> {
     await this.ensureDatabase();
@@ -39,8 +55,8 @@ export default class VectorStore {
 
   async indexFile(file: TFile): Promise<void> {
     await this.ensureDatabase();
-    const content = await this.app.vault.read(file);
-    const chunks = this.chunkByHeaders(content, file.path);
+    const content = await this.app.vault.cachedRead(file);
+    const chunks = this.chunkMarkdown(content, file.path);
     await this.removeBindings(file.path);
     for (const chunk of chunks) {
       await this.insertChunk(chunk);
@@ -73,23 +89,25 @@ export default class VectorStore {
     await this.persistIndex();
   }
 
-  async search(query: string, limit = 6): Promise<ISearchResult[]> {
+  async search(query: string, limit = 6): Promise<VectorSearchResult[]> {
     await this.ensureDatabase();
+    const keywordWeight = this.options.hybridWeights?.keyword ?? 0.55;
+    const vectorWeight = this.options.hybridWeights?.vector ?? 0.45;
     const bm25Results = await this.keywordSearch(query, limit * 2);
     const vectorResults = await this.vectorSearch(query, limit * 2);
-    const combined = new Map<string, ISearchResult>();
+    const combined = new Map<string, VectorSearchResult>();
 
     const maxBm25 = bm25Results.length ? bm25Results[0].score : 1;
     const maxVector = vectorResults.length ? vectorResults[0].score : 1;
 
     for (const result of bm25Results) {
       const normalized = maxBm25 ? result.score / maxBm25 : 0;
-      combined.set(result.blockId, { ...result, score: normalized * 0.55 });
+      combined.set(result.blockId, { ...result, score: normalized * keywordWeight });
     }
 
     for (const result of vectorResults) {
       const normalized = maxVector ? result.score / maxVector : 0;
-      const weighted = normalized * 0.45;
+      const weighted = normalized * vectorWeight;
       const existing = combined.get(result.blockId);
       if (existing) {
         existing.score += weighted;
@@ -104,9 +122,9 @@ export default class VectorStore {
   }
 
   private observeVault(): void {
-    const modifyRef = this.app.vault.on('modify', (file) => this.handleModify(file));
-    const deleteRef = this.app.vault.on('delete', (file) => this.handleDelete(file));
-    const renameRef = this.app.vault.on('rename', (file, oldPath) => this.handleRename(file, oldPath));
+    const modifyRef = this.app.vault.on('modify', (file: TAbstractFile) => this.handleModify(file));
+    const deleteRef = this.app.vault.on('delete', (file: TAbstractFile) => this.handleDelete(file));
+    const renameRef = this.app.vault.on('rename', (file: TAbstractFile, oldPath: string) => this.handleRename(file, oldPath));
     this.plugin.registerEvent(modifyRef);
     this.plugin.registerEvent(deleteRef);
     this.plugin.registerEvent(renameRef);
@@ -139,6 +157,7 @@ export default class VectorStore {
           content: 'string',
           filePath: 'string',
           blockId: 'string',
+          keywords: 'string[]',
         },
       });
     } catch (error) {
@@ -172,59 +191,63 @@ export default class VectorStore {
     this.bindings.delete(filePath);
   }
 
-  private chunkByHeaders(content: string, filePath: string): IndexedChunk[] {
-    const lines = content.split(/\r?\n/);
+  private chunkMarkdown(content: string, filePath: string): IndexedChunk[] {
+    const chunkSize = this.options.chunkTokenTarget ?? 240;
+    const chunkOverlap = this.options.chunkTokenOverlap ?? 40;
+    const maxChunks = this.options.maxChunksPerFile ?? 64;
+    const sections = this.splitByHeadings(content);
     const chunks: IndexedChunk[] = [];
-    let buffer: string[] = [];
-    let header = 'Document';
-    let sectionIndex = 0;
+    let globalIndex = 0;
 
-    const flush = () => {
-      const text = buffer.join('\n').trim();
-      if (!text) {
-        buffer = [];
-        return;
+    for (const section of sections) {
+      const tokens = this.tokenize(section.body);
+      let cursor = 0;
+      while (cursor < tokens.length && chunks.length < maxChunks) {
+        const slice = tokens.slice(cursor, cursor + chunkSize);
+        const text = slice.join(' ');
+        const blockId = this.createBlockId(filePath, section.heading, globalIndex++);
+        const embedding = this.simpleHashEmbedding(text);
+        const keywords = this.extractKeywords(text);
+        chunks.push({
+          id: `${filePath}::${blockId}`,
+          content: text,
+          filePath,
+          blockId,
+          embedding,
+          keywords,
+        });
+        cursor += Math.max(1, chunkSize - chunkOverlap);
       }
-      const blockId = this.createBlockId(filePath, header, sectionIndex++);
-      const embedding = this.simpleFrequencyEmbedding(text);
-      chunks.push({
-        id: `${filePath}::${blockId}`,
-        content: text,
-        filePath,
-        blockId,
-        embedding,
-      });
+    }
+
+    return chunks;
+  }
+
+  private splitByHeadings(content: string): { heading: string; body: string }[] {
+    const lines = content.split(/\r?\n/);
+    const sections: { heading: string; body: string }[] = [];
+    let currentHeading = 'Document';
+    let buffer: string[] = [];
+
+    const pushSection = () => {
+      const body = buffer.join('\n').trim();
+      if (body) {
+        sections.push({ heading: currentHeading, body });
+      }
       buffer = [];
     };
 
     for (const line of lines) {
-      const headingMatch = line.match(/^(#{1,2})\s+(.*)/);
+      const headingMatch = line.match(/^(#{1,6})\s+(.*)/);
       if (headingMatch) {
-        flush();
-        header = headingMatch[2]?.trim() || `Section ${sectionIndex + 1}`;
+        pushSection();
+        currentHeading = headingMatch[2]?.trim() || currentHeading;
         continue;
       }
       buffer.push(line);
     }
-    flush();
-
-    if (!chunks.length) {
-      const fallbackSections = content.split(/\n\n+/);
-      fallbackSections.forEach((section, idx) => {
-        const trimmed = section.trim();
-        if (!trimmed) return;
-        const blockId = this.createBlockId(filePath, 'section', idx);
-        chunks.push({
-          id: `${filePath}::${blockId}`,
-          content: trimmed,
-          filePath,
-          blockId,
-          embedding: this.simpleFrequencyEmbedding(trimmed),
-        });
-      });
-    }
-
-    return chunks;
+    pushSection();
+    return sections.length ? sections : [{ heading: 'Document', body: content }];
   }
 
   private createBlockId(filePath: string, header: string, index: number): string {
@@ -241,11 +264,11 @@ export default class VectorStore {
     return Math.abs(hash).toString(16);
   }
 
-  private async keywordSearch(query: string, limit: number): Promise<ISearchResult[]> {
+  private async keywordSearch(query: string, limit: number): Promise<VectorSearchResult[]> {
     if (this.orama) {
       const results = await this.orama.search(this.db, {
         term: query,
-        properties: ['content', 'filePath'],
+        properties: ['content', 'keywords', 'filePath'],
         limit,
       });
       return results.hits.map((hit: any) => ({
@@ -256,7 +279,7 @@ export default class VectorStore {
       }));
     }
     const tokens = this.tokenize(query);
-    const matches: ISearchResult[] = [];
+    const matches: VectorSearchResult[] = [];
     for (const chunk of this.cachedChunks.values()) {
       const score = this.simpleMatchScore(chunk.content, tokens);
       if (score > 0) {
@@ -266,9 +289,9 @@ export default class VectorStore {
     return matches.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
-  private async vectorSearch(query: string, limit: number): Promise<ISearchResult[]> {
-    const embedding = this.simpleFrequencyEmbedding(query);
-    const results: ISearchResult[] = [];
+  private async vectorSearch(query: string, limit: number): Promise<VectorSearchResult[]> {
+    const embedding = this.simpleHashEmbedding(query);
+    const results: VectorSearchResult[] = [];
     for (const chunk of this.cachedChunks.values()) {
       const score = this.cosineSimilarity(embedding, chunk.embedding);
       results.push({ content: chunk.content, filePath: chunk.filePath, blockId: chunk.blockId, score });
@@ -282,6 +305,16 @@ export default class VectorStore {
       .replace(/[^a-z0-9\s]/g, ' ')
       .split(/\s+/)
       .filter(Boolean);
+  }
+
+  private extractKeywords(text: string): string[] {
+    const tokens = this.tokenize(text);
+    const freq = new Map<string, number>();
+    tokens.forEach((token) => freq.set(token, (freq.get(token) ?? 0) + 1));
+    return Array.from(freq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([token]) => token);
   }
 
   private simpleMatchScore(text: string, tokens: string[]): number {
@@ -304,12 +337,14 @@ export default class VectorStore {
     return dot / denominator;
   }
 
-  private simpleFrequencyEmbedding(text: string): number[] {
+  private simpleHashEmbedding(text: string): number[] {
+    const dims = this.options.embeddingDimensions ?? 256;
+    const vector = new Array<number>(dims).fill(0);
     const tokens = this.tokenize(text);
-    const freq = new Map<string, number>();
-    tokens.forEach((token) => freq.set(token, (freq.get(token) ?? 0) + 1));
-    const sorted = Array.from(freq.keys()).sort();
-    const vector = sorted.map((key) => freq.get(key) ?? 0);
+    tokens.forEach((token) => {
+      const index = Math.abs(this.hashString(token).charCodeAt(0)) % dims;
+      vector[index] += 1;
+    });
     const norm = Math.hypot(...vector) || 1;
     return vector.map((value) => value / norm);
   }
@@ -318,13 +353,7 @@ export default class VectorStore {
     if (!this.plugin || !this.persistPath) return;
     const payload = {
       bindings: Array.from(this.bindings.entries()),
-      chunks: Array.from(this.cachedChunks.values()).map((chunk) => ({
-        id: chunk.id,
-        content: chunk.content,
-        filePath: chunk.filePath,
-        blockId: chunk.blockId,
-        embedding: chunk.embedding,
-      })),
+      chunks: Array.from(this.cachedChunks.values()),
     };
     const serialized = JSON.stringify(payload);
     const existing = this.app.vault.getAbstractFileByPath(this.persistPath);
