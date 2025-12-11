@@ -59,7 +59,7 @@ export default class Orchestrator {
     }
 
     const assistantResponse = await this.router.route('assistant', { messages, context: contextText });
-    if (assistantResponse.text) {
+    if (assistantResponse.provider === 'claude' && assistantResponse.text) {
       return this.applyCitations(assistantResponse.text, searchResults);
     }
 
