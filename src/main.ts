@@ -1,30 +1,19 @@
 import {
   App,
+  ItemView,
   Modal,
   Notice,
   Plugin,
   PluginManifest,
   PluginSettingTab,
   Setting,
+  WorkspaceLeaf,
 } from 'obsidian';
-import Orchestrator from './agents/Orchestrator';
+import Orchestrator from './services/Orchestrator';
 import ModelRouter from './services/ModelRouter';
 import VectorStore from './services/VectorStore';
-import ToolDefinitions from './tools/ToolDefinitions';
-
-interface CortexSettings {
-  salt: string;
-  passphrase: string;
-  encryptedSecrets: Record<string, string>;
-  preferredStorage: 'safeStorage' | 'localStorage';
-}
-
-const DEFAULT_SETTINGS: CortexSettings = {
-  salt: '',
-  passphrase: '',
-  encryptedSecrets: {},
-  preferredStorage: 'safeStorage',
-};
+import ToolsRegistry from './tools/Tools';
+import { ICortexSettings } from './types';
 
 interface SecretStorage {
   saveSecret(key: string, value: string): Promise<void>;
@@ -37,10 +26,27 @@ type ElectronSafeStorage = {
   isEncryptionAvailable: () => boolean;
 };
 
+const DEFAULT_SETTINGS: ICortexSettings = {
+  salt: '',
+  passphrase: '',
+  encryptedSecrets: {},
+  preferredStorage: 'safeStorage',
+  defaultAssistantModel: 'claude-3-5-sonnet-20241022',
+  defaultToolModel: 'gpt-4o-mini',
+  defaultResearchModel: 'gemini-1.5-pro',
+  autoIndex: true,
+  persistIndex: true,
+  indexFilePath: '.cortex-index.json',
+};
+
 class DesktopSafeSecretStorage implements SecretStorage {
   private pluginId: string;
 
-  constructor(manifest: PluginManifest, private persist: (data: Record<string, string>) => Promise<void>, private snapshot: () => Record<string, string>) {
+  constructor(
+    manifest: PluginManifest,
+    private persist: (data: Record<string, string>) => Promise<void>,
+    private snapshot: () => Record<string, string>
+  ) {
     this.pluginId = manifest.id;
   }
 
@@ -87,7 +93,7 @@ class DesktopSafeSecretStorage implements SecretStorage {
 class LocalEncryptedStorage implements SecretStorage {
   private readonly namespace: string;
 
-  constructor(private getSettings: () => CortexSettings) {
+  constructor(private getSettings: () => ICortexSettings) {
     this.namespace = 'obsidian-cortex';
   }
 
@@ -115,20 +121,22 @@ class LocalEncryptedStorage implements SecretStorage {
 }
 
 export default class ObsidianCortexPlugin extends Plugin {
-  settings: CortexSettings = DEFAULT_SETTINGS;
+  settings: ICortexSettings = DEFAULT_SETTINGS;
   private storage: SecretStorage | null = null;
   private modelRouter: ModelRouter | null = null;
   private vectorStore: VectorStore | null = null;
-  private tools: ToolDefinitions | null = null;
+  private tools: ToolsRegistry | null = null;
   private orchestrator: Orchestrator | null = null;
 
   async onload(): Promise<void> {
-    console.log('Obsidian Cortex Architect initialized. Ready to implement the Agentic OS.');
+    console.log('Obsidian Cortex initialized.');
     await this.loadSettings();
     this.storage = this.createStorage();
     await this.initializeCognitiveEngine();
     this.registerCommands();
     this.addSettingTab(new CortexSettingTab(this.app, this));
+    this.registerView(CortexChatView.VIEW_TYPE, (leaf) => new CortexChatView(leaf));
+    this.addRibbonIcon('bot', 'Open Cortex Chat', async () => this.activateCortexChat());
   }
 
   onunload(): void {
@@ -141,9 +149,12 @@ export default class ObsidianCortexPlugin extends Plugin {
       return this.storage?.loadSecret(key) ?? null;
     };
     this.modelRouter = new ModelRouter(loadSecret);
-    this.tools = new ToolDefinitions(this.app);
-    this.vectorStore = new VectorStore(this.app, this, loadSecret);
-    await this.vectorStore.initialize();
+    this.tools = new ToolsRegistry(this.app);
+    const persistPath = this.settings.persistIndex ? this.settings.indexFilePath : '';
+    this.vectorStore = new VectorStore(this.app, this, loadSecret, persistPath);
+    if (this.settings.autoIndex) {
+      await this.vectorStore.initialize();
+    }
     this.orchestrator = new Orchestrator(this.modelRouter, this.vectorStore, this.tools);
   }
 
@@ -164,39 +175,12 @@ export default class ObsidianCortexPlugin extends Plugin {
     return new LocalEncryptedStorage(() => this.settings);
   }
 
-  updateStorageProvider(preferred: CortexSettings['preferredStorage']): void {
+  updateStorageProvider(preferred: ICortexSettings['preferredStorage']): void {
     this.settings.preferredStorage = preferred;
     this.storage = this.createStorage();
   }
 
   private registerCommands(): void {
-    this.addCommand({
-      id: 'obsidian-cortex-store-openai',
-      name: 'Store OpenAI API key',
-      callback: async () => {
-        const value = await this.promptForSecret('Enter your OpenAI API key');
-        if (!value) return;
-        await this.ensureStorage();
-        await this.storage?.saveSecret('openai', value);
-        new Notice('OpenAI API key stored securely.');
-      },
-    });
-
-    this.addCommand({
-      id: 'obsidian-cortex-recall-openai',
-      name: 'Show OpenAI API key (for verification)',
-      callback: async () => {
-        await this.ensureStorage();
-        const secret = await this.storage?.loadSecret('openai');
-        if (!secret) {
-          new Notice('No OpenAI API key found or it could not be decrypted.');
-          return;
-        }
-        new Notice('OpenAI API key loaded. Check the log for the value.');
-        console.log('OpenAI API key', secret);
-      },
-    });
-
     this.addCommand({
       id: 'obsidian-cortex-ask',
       name: 'Ask Obsidian Cortex (Agentic)',
@@ -212,10 +196,16 @@ export default class ObsidianCortexPlugin extends Plugin {
         console.log('Cortex response', response);
       },
     });
-  }
 
-  private async promptForSecret(placeholder: string): Promise<string | null> {
-    return this.promptForInput(placeholder, true);
+    this.addCommand({
+      id: 'obsidian-cortex-reindex',
+      name: 'Rebuild Cortex index',
+      callback: async () => {
+        if (!this.vectorStore) return;
+        await this.vectorStore.indexVault();
+        new Notice('Cortex index rebuilt.');
+      },
+    });
   }
 
   private async promptForInput(placeholder: string, masked: boolean): Promise<string | null> {
@@ -239,6 +229,39 @@ export default class ObsidianCortexPlugin extends Plugin {
       this.storage = this.createStorage();
     }
   }
+
+  private async storeSecret(key: string, value: string): Promise<void> {
+    if (!value.trim()) return;
+    await this.ensureStorage();
+    await this.storage?.saveSecret(key, value.trim());
+  }
+
+  private async activateCortexChat(): Promise<void> {
+    const leaf = this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(false);
+    await leaf.setViewState({ type: CortexChatView.VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+}
+
+class CortexChatView extends ItemView {
+  static VIEW_TYPE = 'cortex-chat-view';
+
+  constructor(leaf: WorkspaceLeaf) {
+    super(leaf);
+  }
+
+  getViewType(): string {
+    return CortexChatView.VIEW_TYPE;
+  }
+
+  getDisplayText(): string {
+    return 'Cortex Chat';
+  }
+
+  async onOpen(): Promise<void> {
+    this.containerEl.empty();
+    this.containerEl.createEl('div', { text: 'Cortex Chat UI coming soon.' });
+  }
 }
 
 class CortexSettingTab extends PluginSettingTab {
@@ -246,10 +269,15 @@ class CortexSettingTab extends PluginSettingTab {
     super(app, plugin);
   }
 
-  display(): void {
+  async display(): Promise<void> {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: 'Obsidian Cortex — Security Preferences' });
+    containerEl.createEl('h2', { text: 'Obsidian Cortex — Security & Models' });
+
+    await this.plugin.ensureStorage();
+    const openaiPresent = (await this.plugin.storage?.loadSecret('openai')) ? 'Stored' : 'Not set';
+    const geminiPresent = (await this.plugin.storage?.loadSecret('gemini')) ? 'Stored' : 'Not set';
+    const anthropicPresent = (await this.plugin.storage?.loadSecret('anthropic')) ? 'Stored' : 'Not set';
 
     new Setting(containerEl)
       .setName('Preferred storage provider')
@@ -260,7 +288,7 @@ class CortexSettingTab extends PluginSettingTab {
           .addOption('localStorage', 'Local encrypted storage')
           .setValue(this.plugin.settings.preferredStorage)
           .onChange(async (value) => {
-            this.plugin.updateStorageProvider(value as CortexSettings['preferredStorage']);
+            this.plugin.updateStorageProvider(value as ICortexSettings['preferredStorage']);
             await this.plugin.saveSettings();
           });
       });
@@ -287,6 +315,111 @@ class CortexSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.salt)
           .onChange(async (value) => {
             this.plugin.settings.salt = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('OpenAI API Key')
+      .setDesc(`Status: ${openaiPresent}`)
+      .addText((text) =>
+        text
+          .setPlaceholder('sk-...')
+          .onChange(async (value) => {
+            await this.plugin.storeSecret('openai', value);
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Gemini API Key')
+      .setDesc(`Status: ${geminiPresent}`)
+      .addText((text) =>
+        text
+          .setPlaceholder('AIza...')
+          .onChange(async (value) => {
+            await this.plugin.storeSecret('gemini', value);
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Anthropic API Key')
+      .setDesc(`Status: ${anthropicPresent}`)
+      .addText((text) =>
+        text
+          .setPlaceholder('sk-ant-...')
+          .onChange(async (value) => {
+            await this.plugin.storeSecret('anthropic', value);
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Assistant model (Claude)')
+      .setDesc('Model used for the assistant persona.')
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.defaultAssistantModel)
+          .setValue(this.plugin.settings.defaultAssistantModel)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultAssistantModel = value || DEFAULT_SETTINGS.defaultAssistantModel;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Tool model (GPT-4o)')
+      .setDesc('Model used for function calling and tool routing.')
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.defaultToolModel)
+          .setValue(this.plugin.settings.defaultToolModel)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultToolModel = value || DEFAULT_SETTINGS.defaultToolModel;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Research model (Gemini)')
+      .setDesc('Model used for deep research with cached context.')
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.defaultResearchModel)
+          .setValue(this.plugin.settings.defaultResearchModel)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultResearchModel = value || DEFAULT_SETTINGS.defaultResearchModel;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Auto-index vault')
+      .setDesc('Automatically index notes on startup and when they change.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
+          this.plugin.settings.autoIndex = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Persist index to vault')
+      .setDesc('Store the index JSON in the vault for faster reloads.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.persistIndex).onChange(async (value) => {
+          this.plugin.settings.persistIndex = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Index file path')
+      .setDesc('Relative path inside the vault for storing the index JSON.')
+      .addText((text) =>
+        text
+          .setPlaceholder('.cortex-index.json')
+          .setValue(this.plugin.settings.indexFilePath)
+          .onChange(async (value) => {
+            this.plugin.settings.indexFilePath = value || DEFAULT_SETTINGS.indexFilePath;
             await this.plugin.saveSettings();
           })
       );
@@ -327,11 +460,7 @@ async function encryptString(plainText: string, passphrase: string, salt: string
   const encoder = new TextEncoder();
   const key = await deriveAesKey(passphrase, salt);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    encoder.encode(plainText)
-  );
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(plainText));
   const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
   combined.set(iv, 0);
   combined.set(new Uint8Array(encrypted), iv.byteLength);
@@ -343,24 +472,14 @@ async function decryptString(payload: string, passphrase: string, salt: string):
   const iv = data.slice(0, 12);
   const cipher = data.slice(12);
   const key = await deriveAesKey(passphrase, salt);
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: new Uint8Array(iv) },
-    key,
-    cipher
-  );
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key, cipher);
   const decoder = new TextDecoder();
   return decoder.decode(decrypted);
 }
 
 async function deriveAesKey(passphrase: string, salt: string): Promise<CryptoKey> {
   const encoder = new TextEncoder();
-  const baseKey = await crypto.subtle.importKey(
-    'raw',
-    encoder.encode(passphrase),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
+  const baseKey = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
@@ -369,10 +488,7 @@ async function deriveAesKey(passphrase: string, salt: string): Promise<CryptoKey
       hash: 'SHA-256',
     },
     baseKey,
-    {
-      name: 'AES-GCM',
-      length: 256,
-    },
+    { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
   );

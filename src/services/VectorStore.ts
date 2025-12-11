@@ -1,29 +1,135 @@
 import { App, Plugin, TAbstractFile, TFile } from 'obsidian';
-import { CortexChunk, SearchResult, SecretLoader } from '../types';
+import { ISearchResult, SecretLoader } from '../types';
+
+interface IndexedChunk {
+  id: string;
+  content: string;
+  filePath: string;
+  blockId: string;
+  embedding: number[];
+}
 
 interface FallbackIndex {
-  chunks: Map<string, CortexChunk>;
+  chunks: Map<string, IndexedChunk>;
 }
 
 export default class VectorStore {
   private db: any | FallbackIndex | null = null;
   private orama: any | null = null;
-  private embeddings = new Map<string, number[]>();
-  private fileBindings = new Map<string, string[]>();
-  private chunkCache = new Map<string, CortexChunk>();
-  private transformerPipeline: any | null = null;
-  private loadingLocalTransformer = false;
+  private bindings = new Map<string, string[]>();
+  private cachedChunks = new Map<string, IndexedChunk>();
+  private loading = false;
 
-  constructor(private app: App, private plugin: Plugin, private loadSecret: SecretLoader) {}
+  constructor(private app: App, private plugin: Plugin, private loadSecret: SecretLoader, private persistPath = '.cortex-index.json') {}
 
   async initialize(): Promise<void> {
     await this.ensureDatabase();
-    await this.indexExistingNotes();
+    await this.restoreIndex();
+    await this.indexVault();
     this.observeVault();
   }
 
+  async indexVault(): Promise<void> {
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      await this.indexFile(file);
+    }
+    await this.persistIndex();
+  }
+
+  async indexFile(file: TFile): Promise<void> {
+    await this.ensureDatabase();
+    const content = await this.app.vault.read(file);
+    const chunks = this.chunkByHeaders(content, file.path);
+    await this.removeBindings(file.path);
+    for (const chunk of chunks) {
+      await this.insertChunk(chunk);
+    }
+    this.bindings.set(file.path, chunks.map((chunk) => chunk.id));
+    await this.persistIndex();
+  }
+
+  async removeFile(filePath: string): Promise<void> {
+    await this.removeBindings(filePath);
+    await this.persistIndex();
+  }
+
+  async renameFile(oldPath: string, newPath: string): Promise<void> {
+    const ids = this.bindings.get(oldPath);
+    if (!ids) return;
+    for (const id of ids) {
+      const chunk = this.cachedChunks.get(id);
+      if (!chunk) continue;
+      const updated: IndexedChunk = { ...chunk, filePath: newPath };
+      this.cachedChunks.set(id, updated);
+      if (this.orama) {
+        await this.orama.insert(this.db, updated);
+      } else {
+        (this.db as FallbackIndex).chunks.set(id, updated);
+      }
+    }
+    this.bindings.delete(oldPath);
+    this.bindings.set(newPath, ids);
+    await this.persistIndex();
+  }
+
+  async search(query: string, limit = 6): Promise<ISearchResult[]> {
+    await this.ensureDatabase();
+    const bm25Results = await this.keywordSearch(query, limit * 2);
+    const vectorResults = await this.vectorSearch(query, limit * 2);
+    const combined = new Map<string, ISearchResult>();
+
+    const maxBm25 = bm25Results.length ? bm25Results[0].score : 1;
+    const maxVector = vectorResults.length ? vectorResults[0].score : 1;
+
+    for (const result of bm25Results) {
+      const normalized = maxBm25 ? result.score / maxBm25 : 0;
+      combined.set(result.blockId, { ...result, score: normalized * 0.55 });
+    }
+
+    for (const result of vectorResults) {
+      const normalized = maxVector ? result.score / maxVector : 0;
+      const weighted = normalized * 0.45;
+      const existing = combined.get(result.blockId);
+      if (existing) {
+        existing.score += weighted;
+      } else {
+        combined.set(result.blockId, { ...result, score: weighted });
+      }
+    }
+
+    return Array.from(combined.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+  }
+
+  private observeVault(): void {
+    const modifyRef = this.app.vault.on('modify', (file) => this.handleModify(file));
+    const deleteRef = this.app.vault.on('delete', (file) => this.handleDelete(file));
+    const renameRef = this.app.vault.on('rename', (file, oldPath) => this.handleRename(file, oldPath));
+    this.plugin.registerEvent(modifyRef);
+    this.plugin.registerEvent(deleteRef);
+    this.plugin.registerEvent(renameRef);
+  }
+
+  private async handleModify(file: TAbstractFile): Promise<void> {
+    if (!(file instanceof TFile) || file.extension !== 'md') return;
+    await this.indexFile(file);
+  }
+
+  private async handleDelete(file: TAbstractFile): Promise<void> {
+    if (!(file instanceof TFile) || file.extension !== 'md') return;
+    await this.removeFile(file.path);
+  }
+
+  private async handleRename(file: TAbstractFile, oldPath: string): Promise<void> {
+    if (!(file instanceof TFile) || file.extension !== 'md') return;
+    await this.renameFile(oldPath, file.path);
+  }
+
   private async ensureDatabase(): Promise<void> {
-    if (this.db) return;
+    if (this.db || this.loading) return;
+    this.loading = true;
     try {
       const orama = await import('@orama/orama');
       this.orama = orama;
@@ -36,47 +142,15 @@ export default class VectorStore {
         },
       });
     } catch (error) {
-      console.warn('Orama is unavailable; using fallback in-memory index.', error);
-      this.db = { chunks: new Map<string, CortexChunk>() };
+      console.warn('Orama unavailable; using fallback index.', error);
+      this.db = { chunks: new Map<string, IndexedChunk>() };
+    } finally {
+      this.loading = false;
     }
   }
 
-  private observeVault(): void {
-    const ref = this.app.vault.on('modify', (file) => this.handleModify(file));
-    this.plugin.registerEvent(ref);
-  }
-
-  private async handleModify(file: TAbstractFile): Promise<void> {
-    if (!(file instanceof TFile) || file.extension !== 'md') return;
-    await this.indexFile(file);
-  }
-
-  private async indexExistingNotes(): Promise<void> {
-    const markdownFiles = this.app.vault.getMarkdownFiles();
-    for (const file of markdownFiles) {
-      await this.indexFile(file);
-    }
-  }
-
-  async indexFile(file: TFile): Promise<void> {
-    await this.ensureDatabase();
-    const content = await this.app.vault.read(file);
-    const chunks = this.chunkByHeaders(content, file.path);
-    await this.removeFileChunks(file.path);
-    for (const chunk of chunks) {
-      await this.insertChunk(chunk);
-    }
-    this.fileBindings.set(
-      file.path,
-      chunks.map((chunk) => chunk.id)
-    );
-  }
-
-  private async insertChunk(chunk: CortexChunk): Promise<void> {
-    if (!this.db) return;
-    const embedding = await this.embed(chunk.content);
-    this.embeddings.set(chunk.id, embedding);
-    this.chunkCache.set(chunk.id, chunk);
+  private async insertChunk(chunk: IndexedChunk): Promise<void> {
+    this.cachedChunks.set(chunk.id, chunk);
     if (this.orama) {
       await this.orama.insert(this.db, chunk);
     } else {
@@ -84,141 +158,122 @@ export default class VectorStore {
     }
   }
 
-  private async removeFileChunks(filePath: string): Promise<void> {
-    const ids = this.fileBindings.get(filePath);
-    if (!ids || !this.db) return;
+  private async removeBindings(filePath: string): Promise<void> {
+    const ids = this.bindings.get(filePath);
+    if (!ids) return;
     for (const id of ids) {
-      this.embeddings.delete(id);
-      this.chunkCache.delete(id);
+      this.cachedChunks.delete(id);
       if (this.orama) {
         await this.orama.remove(this.db, id);
       } else {
         (this.db as FallbackIndex).chunks.delete(id);
       }
     }
-    this.fileBindings.delete(filePath);
+    this.bindings.delete(filePath);
   }
 
-  async search(query: string, limit = 5): Promise<SearchResult[]> {
-    await this.ensureDatabase();
-    const bm25Results = await this.bm25Search(query, limit * 2);
-    const vectorResults = await this.vectorSearch(query);
-    const combined = new Map<string, SearchResult>();
-
-    const maxBm25 = bm25Results.length ? bm25Results[0].score : 1;
-    const maxVector = vectorResults.length ? vectorResults[0].score : 1;
-
-    for (const result of bm25Results) {
-      const normalized = maxBm25 ? result.score / maxBm25 : 0;
-      combined.set(result.chunk.id, { chunk: result.chunk, score: normalized * 0.6 });
-    }
-
-    for (const result of vectorResults) {
-      const normalized = maxVector ? result.score / maxVector : 0;
-      const existing = combined.get(result.chunk.id);
-      const weighted = normalized * 0.4;
-      if (existing) {
-        existing.score += weighted;
-      } else {
-        combined.set(result.chunk.id, { chunk: result.chunk, score: weighted });
-      }
-    }
-
-    return Array.from(combined.values())
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
-  }
-
-  private async bm25Search(query: string, limit: number): Promise<SearchResult[]> {
-    if (!this.db) return [];
-    if (this.orama) {
-      const result = await this.orama.search(this.db, {
-        term: query,
-        properties: ['content'],
-        limit,
-      });
-      return result.hits.map((hit: any) => ({ chunk: hit.document as CortexChunk, score: hit.score }));
-    }
-    const hits: SearchResult[] = [];
-    const tokens = this.tokenize(query);
-    (this.db as FallbackIndex).chunks.forEach((chunk) => {
-      const score = this.simpleMatchScore(chunk.content, tokens);
-      if (score > 0) {
-        hits.push({ chunk, score });
-      }
-    });
-    return hits.sort((a, b) => b.score - a.score).slice(0, limit);
-  }
-
-  private async vectorSearch(query: string): Promise<SearchResult[]> {
-    const queryEmbedding = await this.embed(query);
-    const results: SearchResult[] = [];
-    for (const [id, embedding] of this.embeddings.entries()) {
-      const score = this.cosineSimilarity(queryEmbedding, embedding);
-      if (score <= 0) continue;
-      const chunk = this.getChunkById(id);
-      if (chunk) {
-        results.push({ chunk, score });
-      }
-    }
-    return results.sort((a, b) => b.score - a.score);
-  }
-
-  private getChunkById(id: string): CortexChunk | null {
-    if (!this.db) return null;
-    return this.chunkCache.get(id) ?? null;
-  }
-
-  private chunkByHeaders(content: string, filePath: string): CortexChunk[] {
+  private chunkByHeaders(content: string, filePath: string): IndexedChunk[] {
     const lines = content.split(/\r?\n/);
-    const chunks: CortexChunk[] = [];
+    const chunks: IndexedChunk[] = [];
     let buffer: string[] = [];
-    let currentHeading = 'root';
+    let header = 'Document';
     let sectionIndex = 0;
-    let blankRowCount = 0;
 
     const flush = () => {
-      if (!buffer.length) return;
       const text = buffer.join('\n').trim();
       if (!text) {
         buffer = [];
-        blankRowCount = 0;
         return;
       }
-      const id = `${filePath}::${currentHeading}-${sectionIndex}`;
-      const blockId = `${currentHeading}-${sectionIndex}`;
-      chunks.push({ id, content: text, filePath, blockId });
-      sectionIndex += 1;
+      const blockId = this.createBlockId(filePath, header, sectionIndex++);
+      const embedding = this.simpleFrequencyEmbedding(text);
+      chunks.push({
+        id: `${filePath}::${blockId}`,
+        content: text,
+        filePath,
+        blockId,
+        embedding,
+      });
       buffer = [];
-      blankRowCount = 0;
     };
 
     for (const line of lines) {
-      const headingMatch = /^(#{1,2})\s+(.*)/.exec(line);
-      const isBlank = line.trim().length === 0;
+      const headingMatch = line.match(/^(#{1,2})\s+(.*)/);
       if (headingMatch) {
         flush();
-        currentHeading = this.slugify(headingMatch[2]);
+        header = headingMatch[2]?.trim() || `Section ${sectionIndex + 1}`;
         continue;
-      }
-      if (isBlank) {
-        blankRowCount += 1;
-        if (blankRowCount >= 2) {
-          flush();
-          continue;
-        }
-      } else {
-        blankRowCount = 0;
       }
       buffer.push(line);
     }
     flush();
+
+    if (!chunks.length) {
+      const fallbackSections = content.split(/\n\n+/);
+      fallbackSections.forEach((section, idx) => {
+        const trimmed = section.trim();
+        if (!trimmed) return;
+        const blockId = this.createBlockId(filePath, 'section', idx);
+        chunks.push({
+          id: `${filePath}::${blockId}`,
+          content: trimmed,
+          filePath,
+          blockId,
+          embedding: this.simpleFrequencyEmbedding(trimmed),
+        });
+      });
+    }
+
     return chunks;
   }
 
-  private slugify(input: string): string {
-    const cleaned = input.trim().toLowerCase().replace(/[^a-z0-9\-\s]/g, '');
-    return cleaned.replace(/\s+/g, '-').replace(/-+/g, '-') || 'section';
+  private createBlockId(filePath: string, header: string, index: number): string {
+    const base = `${filePath}-${header}-${index}`;
+    return `block-${this.hashString(base).slice(0, 8)}`;
+  }
+
+  private hashString(input: string): string {
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      hash = (hash << 5) - hash + input.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(16);
+  }
+
+  private async keywordSearch(query: string, limit: number): Promise<ISearchResult[]> {
+    if (this.orama) {
+      const results = await this.orama.search(this.db, {
+        term: query,
+        properties: ['content', 'filePath'],
+        limit,
+      });
+      return results.hits.map((hit: any) => ({
+        content: hit.document.content,
+        filePath: hit.document.filePath,
+        blockId: hit.document.blockId,
+        score: hit.score,
+      }));
+    }
+    const tokens = this.tokenize(query);
+    const matches: ISearchResult[] = [];
+    for (const chunk of this.cachedChunks.values()) {
+      const score = this.simpleMatchScore(chunk.content, tokens);
+      if (score > 0) {
+        matches.push({ content: chunk.content, filePath: chunk.filePath, blockId: chunk.blockId, score });
+      }
+    }
+    return matches.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  private async vectorSearch(query: string, limit: number): Promise<ISearchResult[]> {
+    const embedding = this.simpleFrequencyEmbedding(query);
+    const results: ISearchResult[] = [];
+    for (const chunk of this.cachedChunks.values()) {
+      const score = this.cosineSimilarity(embedding, chunk.embedding);
+      results.push({ content: chunk.content, filePath: chunk.filePath, blockId: chunk.blockId, score });
+    }
+    return results.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   private tokenize(text: string): string[] {
@@ -229,117 +284,75 @@ export default class VectorStore {
       .filter(Boolean);
   }
 
-  private async embed(text: string): Promise<number[]> {
-    const normalized = text.trim();
-    if (!normalized) return [0];
-    if (this.appIsMobile()) {
-      const mobileVector = await this.embedWithOpenAI(normalized);
-      if (mobileVector) return mobileVector;
-    } else {
-      const local = await this.embedWithLocalTransformers(normalized);
-      if (local) return local;
-      const desktopVector = await this.embedWithOpenAI(normalized);
-      if (desktopVector) return desktopVector;
-    }
-
-    return this.simpleFrequencyEmbedding(normalized);
+  private simpleMatchScore(text: string, tokens: string[]): number {
+    const haystack = text.toLowerCase();
+    return tokens.reduce((acc, token) => (haystack.includes(token) ? acc + 1 : acc), 0);
   }
 
   private cosineSimilarity(a: number[], b: number[]): number {
-    if (!a.length || !b.length) return 0;
-    const minLength = Math.min(a.length, b.length);
+    const minLen = Math.min(a.length, b.length);
+    if (!minLen) return 0;
     let dot = 0;
-    for (let i = 0; i < minLength; i++) {
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < minLen; i++) {
       dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
     }
-    return dot;
-  }
-
-  private simpleMatchScore(text: string, tokens: string[]): number {
-    let score = 0;
-    const haystack = text.toLowerCase();
-    for (const token of tokens) {
-      if (haystack.includes(token)) {
-        score += 1;
-      }
-    }
-    return score;
-  }
-
-  private async embedWithOpenAI(text: string): Promise<number[] | null> {
-    const apiKey = await this.loadSecret('openai');
-    if (!apiKey) return null;
-    try {
-      const response = await fetch('https://api.openai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: 'text-embedding-3-small',
-          input: text.slice(0, 7000),
-        }),
-      });
-      if (!response.ok) {
-        console.warn('OpenAI embeddings failed', response.status, response.statusText);
-        return null;
-      }
-      const payload = await response.json();
-      const vector = payload?.data?.[0]?.embedding as number[] | undefined;
-      return Array.isArray(vector) ? vector : null;
-    } catch (error) {
-      console.warn('OpenAI embeddings error', error);
-      return null;
-    }
-  }
-
-  private async embedWithLocalTransformers(text: string): Promise<number[] | null> {
-    if (this.transformerPipeline) {
-      return this.runTransformer(text);
-    }
-    if (this.loadingLocalTransformer) return null;
-    this.loadingLocalTransformer = true;
-    try {
-      const transformers = (window as any).transformers;
-      if (!transformers?.pipeline) return null;
-      this.transformerPipeline = await transformers.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
-      return this.runTransformer(text);
-    } catch (error) {
-      console.warn('Local transformer unavailable', error);
-      return null;
-    } finally {
-      this.loadingLocalTransformer = false;
-    }
-  }
-
-  private async runTransformer(text: string): Promise<number[] | null> {
-    if (!this.transformerPipeline) return null;
-    try {
-      const output = await this.transformerPipeline(text, { pooling: 'mean', normalize: true });
-      const data = Array.from(output.data ?? []) as any[];
-      const vector = data.map((value) => Number(value));
-      return vector.length ? vector : null;
-    } catch (error) {
-      console.warn('Transformer embedding failed', error);
-      return null;
-    }
+    const denominator = Math.sqrt(normA) * Math.sqrt(normB) || 1;
+    return dot / denominator;
   }
 
   private simpleFrequencyEmbedding(text: string): number[] {
     const tokens = this.tokenize(text);
-    const frequencies = new Map<string, number>();
-    tokens.forEach((token) => frequencies.set(token, (frequencies.get(token) ?? 0) + 1));
-    const vector: number[] = [];
-    const vocab = Array.from(frequencies.keys()).sort();
-    for (const term of vocab) {
-      vector.push(frequencies.get(term) ?? 0);
-    }
+    const freq = new Map<string, number>();
+    tokens.forEach((token) => freq.set(token, (freq.get(token) ?? 0) + 1));
+    const sorted = Array.from(freq.keys()).sort();
+    const vector = sorted.map((key) => freq.get(key) ?? 0);
     const norm = Math.hypot(...vector) || 1;
     return vector.map((value) => value / norm);
   }
 
-  private appIsMobile(): boolean {
-    return Boolean((this.app as any).isMobile);
+  private async persistIndex(): Promise<void> {
+    if (!this.plugin || !this.persistPath) return;
+    const payload = {
+      bindings: Array.from(this.bindings.entries()),
+      chunks: Array.from(this.cachedChunks.values()).map((chunk) => ({
+        id: chunk.id,
+        content: chunk.content,
+        filePath: chunk.filePath,
+        blockId: chunk.blockId,
+        embedding: chunk.embedding,
+      })),
+    };
+    const serialized = JSON.stringify(payload);
+    const existing = this.app.vault.getAbstractFileByPath(this.persistPath);
+    if (existing instanceof TFile) {
+      await this.app.vault.process(existing, () => serialized);
+    } else {
+      await this.app.vault.create(this.persistPath, serialized);
+    }
+  }
+
+  private async restoreIndex(): Promise<void> {
+    if (!this.persistPath) return;
+    const existing = this.app.vault.getAbstractFileByPath(this.persistPath);
+    if (!(existing instanceof TFile)) return;
+    try {
+      const content = await this.app.vault.read(existing);
+      const payload = JSON.parse(content) as { bindings: [string, string[]][]; chunks: IndexedChunk[] };
+      this.bindings = new Map(payload.bindings);
+      payload.chunks.forEach((chunk) => {
+        this.cachedChunks.set(chunk.id, chunk);
+        if (this.orama) {
+          this.orama.insert(this.db, chunk);
+        } else {
+          (this.db as FallbackIndex).chunks.set(chunk.id, chunk);
+        }
+      });
+    } catch (error) {
+      console.warn('Failed to restore index, rebuilding from vault.', error);
+    }
   }
 }

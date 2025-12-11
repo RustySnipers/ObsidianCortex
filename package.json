@@ -8,7 +8,10 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@orama/orama": "^1.4.2"
+    "@anthropic-ai/sdk": "^0.25.1",
+    "@google/generative-ai": "^0.8.0",
+    "@orama/orama": "^1.4.2",
+    "openai": "^4.77.4"
   },
   "devDependencies": {
     "obsidian": "latest",

@@ -1,75 +1,150 @@
-import { ModelMessage, ModelRequest, ModelResponse, ToolCall, SecretLoader } from '../types';
+import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
+import { ILLMMessage, ModelRouterResponse, SecretLoader } from '../types';
 
 interface GeminiCacheEntry {
   id: string;
+  digest: string;
   created: number;
-  summary: string;
 }
 
 const CLAUDE_PERSONA_PROMPT =
-  'You are Claude 3.5 Sonnet acting as the personal assistant within Obsidian Cortex. Maintain concise, actionable responses and remember context when provided. System prompts are cached for efficiency; do not expose cache details to the user.';
+  'You are Claude 3.5 Sonnet acting as the personal assistant within Obsidian Cortex. Use concise, actionable responses and respect vault citations when provided. System prompts are cacheable; do not expose cache details to the user.';
 
 export default class ModelRouter {
   private geminiCache = new Map<string, GeminiCacheEntry>();
+  private openaiClient: OpenAI | null = null;
+  private anthropicClient: Anthropic | null = null;
+  private geminiClient: GoogleGenerativeAI | null = null;
 
   constructor(private loadSecret: SecretLoader) {}
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
-    switch (request.task) {
-      case 'research':
-        return this.callGeminiPro(request);
-      case 'chat':
-        return this.callClaudeSonnet(request);
-      case 'execute':
-      default:
-        return this.callGpt4o(request);
-    }
-  }
-
-  private async callGeminiPro(request: ModelRequest): Promise<ModelResponse> {
-    const apiKey = await this.getApiKey(['gemini', 'google']);
+  async runDeepResearch(prompt: string, context: string, messages: ILLMMessage[]): Promise<ModelRouterResponse> {
+    const apiKey = await this.getApiKey(['gemini', 'google', 'gemini-pro']);
     if (!apiKey) {
       return { text: 'Gemini API key is missing. Please store a key labeled "gemini" or "google".' };
     }
-    const cache = request.context ? await this.cacheVaultContext(apiKey, request.context) : null;
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${encodeURIComponent(
-      apiKey
-    )}`;
-    const messages: ModelMessage[] = request.messages ?? [{ role: 'user', content: request.prompt }];
-    if (request.context) {
-      messages.push({ role: 'user', content: `Cached vault context:\n${request.context}` });
-    }
-    const payload: Record<string, any> = {
-      contents: messages.map((message) => ({ role: message.role, parts: [{ text: message.content }] })),
-    };
-    if (cache) {
-      payload.cachedContent = { name: cache.id };
-      payload.tools = [
-        {
-          functionDeclarations: [
+    const cacheEntry = await this.ensureGeminiCache(apiKey, context);
+    const model = this.getGeminiClient(apiKey).getGenerativeModel({ model: 'gemini-1.5-pro' });
+    const contents = messages.map((message) => ({
+      role: message.role === 'assistant' ? 'model' : message.role,
+      parts: [{ text: message.content }],
+    }));
+    const result = await model.generateContent({
+      contents,
+      systemInstruction: cacheEntry ? { text: 'Cached vault context available.' } : undefined,
+      tools: cacheEntry
+        ? [
             {
-              name: 'context_cache',
-              description: cache.summary,
-              parameters: { type: 'object', properties: {} },
+              functionDeclarations: [
+                {
+                  name: 'vault_context_cache',
+                  description: 'Provides cached vault context for retrieval augmented responses.',
+                  parameters: { type: 'object', properties: {} },
+                },
+              ],
             },
-          ],
-        },
-      ];
-    }
-
-    const response = await this.safeJsonRequest(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+          ]
+        : undefined,
+      cachedContent: cacheEntry ? { name: cacheEntry.id } : undefined,
+      generationConfig: { temperature: 0.3 },
+      contentsDelta: cacheEntry ? undefined : undefined,
     });
-
-    const text =
-      response?.candidates?.[0]?.content?.parts?.map((part: any) => part?.text).join('\n') ??
+    const responseText = result.response?.candidates?.[0]?.content?.parts?.map((part) => part.text).join('\n') ??
+      result.response?.text() ??
       'Gemini did not return a response.';
-    return { text, metadata: { cacheId: cache?.id }, provider: 'gemini-pro' };
+    return { text: responseText, metadata: { cacheId: cacheEntry?.id }, provider: 'gemini-pro' };
   }
 
-  private async cacheVaultContext(apiKey: string, context: string): Promise<GeminiCacheEntry | null> {
+  async runAssistant(prompt: string, context: string, messages: ILLMMessage[]): Promise<ModelRouterResponse> {
+    const apiKey = await this.getApiKey(['anthropic', 'claude']);
+    if (!apiKey) {
+      return { text: 'Anthropic API key is missing. Please store a key labeled "anthropic" or "claude".' };
+    }
+    const client = this.getAnthropicClient(apiKey);
+    const combinedMessages = [
+      {
+        role: 'system' as const,
+        content: [
+          {
+            type: 'text',
+            text: CLAUDE_PERSONA_PROMPT,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      },
+      ...messages.map((message) => ({
+        role: message.role,
+        content: [{ type: 'text', text: message.content }],
+      })),
+      { role: 'user' as const, content: [{ type: 'text', text: `Context:\n${context}` }] },
+    ];
+    const completion = await client.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: combinedMessages as any,
+    });
+    const text = completion.content?.[0]?.text ?? 'Claude did not return a response.';
+    return { text, metadata: { cache: 'ephemeral' }, provider: 'claude-sonnet' };
+  }
+
+  async runToolCall(messages: ILLMMessage[], tools: any[]): Promise<ModelRouterResponse> {
+    const apiKey = await this.getApiKey(['openai']);
+    if (!apiKey) {
+      return { text: 'OpenAI API key is missing. Please store it via the secure storage command.' };
+    }
+    const client = this.getOpenAIClient(apiKey);
+    const completion = await client.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      tools: tools.map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.schema,
+        },
+      })),
+      tool_choice: 'auto',
+      temperature: 0.2,
+    });
+    const choice = completion.choices[0];
+    const text = choice.message.content ?? '';
+    const toolCalls = choice.message.tool_calls?.map((call) => {
+      let args: Record<string, any> = {};
+      try {
+        args = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : call.function.arguments;
+      } catch (error) {
+        console.error('Failed to parse tool call arguments', error);
+      }
+      return { name: call.function.name, arguments: args, id: call.id };
+    });
+    return { text, toolCalls, provider: 'gpt-4o' };
+  }
+
+  private getOpenAIClient(apiKey: string): OpenAI {
+    if (!this.openaiClient) {
+      this.openaiClient = new OpenAI({ apiKey, dangerouslyAllowBrowser: true });
+    }
+    return this.openaiClient;
+  }
+
+  private getAnthropicClient(apiKey: string): Anthropic {
+    if (!this.anthropicClient) {
+      this.anthropicClient = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+    }
+    return this.anthropicClient;
+  }
+
+  private getGeminiClient(apiKey: string): GoogleGenerativeAI {
+    if (!this.geminiClient) {
+      this.geminiClient = new GoogleGenerativeAI(apiKey);
+    }
+    return this.geminiClient;
+  }
+
+  private async ensureGeminiCache(apiKey: string, context: string): Promise<GeminiCacheEntry | null> {
     const digest = await this.digestText(context);
     const existing = this.geminiCache.get(digest);
     if (existing) return existing;
@@ -77,102 +152,23 @@ export default class ModelRouter {
     const url = `https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${encodeURIComponent(apiKey)}`;
     const payload = {
       displayName: 'Obsidian Cortex cached context',
-      contents: [{ parts: [{ text: context.slice(0, 15000) }] }],
+      contents: [{ parts: [{ text: context.slice(0, 20000) }] }],
     };
-    const response = await this.safeJsonRequest(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const id: string | undefined = response?.name;
-    if (!id) return null;
-    const summary = `Cached vault context reference ${id}`;
-    const entry = { id, created: Date.now(), summary };
-    this.geminiCache.set(digest, entry);
-    return entry;
-  }
-
-  private async callClaudeSonnet(request: ModelRequest): Promise<ModelResponse> {
-    const apiKey = await this.getApiKey(['anthropic', 'claude']);
-    if (!apiKey) {
-      return { text: 'Anthropic API key is missing. Please store a key labeled "anthropic" or "claude".' };
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      const entry: GeminiCacheEntry = { id: data?.name, digest, created: Date.now() };
+      this.geminiCache.set(digest, entry);
+      return entry;
+    } catch (error) {
+      console.error('Failed to cache Gemini context', error);
+      return null;
     }
-    const userMessages = request.messages ?? [{ role: 'user', content: request.prompt }];
-    if (request.context) {
-      userMessages.push({ role: 'user', content: `Context:\n${request.context}` });
-    }
-    const body = {
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 1024,
-      messages: [
-        {
-          role: 'system',
-          content: [
-            {
-              type: 'text',
-              text: CLAUDE_PERSONA_PROMPT,
-              cache_control: { type: 'ttl', ttl: 60 * 60 * 24 },
-            },
-          ],
-        },
-        ...userMessages.map((message) => ({
-          role: message.role,
-          content: [{ type: 'text', text: message.content }],
-        })),
-      ],
-    };
-    const response = await this.safeJsonRequest('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'prompt-caching-2024-07-31',
-        'anthropic-cache-control': 'max-age=86400',
-      },
-      body: JSON.stringify(body),
-    });
-    const text = response?.content?.[0]?.text ?? 'Claude did not return a response.';
-    return { text, metadata: { cache: 'persona' }, provider: 'claude-sonnet' };
-  }
-
-  private async callGpt4o(request: ModelRequest): Promise<ModelResponse> {
-    const apiKey = await this.getApiKey(['openai']);
-    if (!apiKey) {
-      return { text: 'OpenAI API key is missing. Please store it via the secure storage command.' };
-    }
-    const messages = request.messages ?? [{ role: 'user', content: request.prompt }];
-    if (request.context) {
-      messages.push({ role: 'user', content: `Context:\n${request.context}` });
-    }
-    const body: Record<string, any> = {
-      model: 'gpt-4o-mini',
-      messages,
-    };
-    if (request.tools && request.tools.length) {
-      body.tools = request.tools.map((tool) => ({ type: 'function', function: tool }));
-      body.tool_choice = 'auto';
-    }
-    const response = await this.safeJsonRequest('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-    });
-    const choice = response?.choices?.[0];
-    const text: string = choice?.message?.content ?? 'The model did not return content.';
-    const toolCalls: ToolCall[] | undefined = choice?.message?.tool_calls?.map((call: any) => {
-      let args: Record<string, any> = {};
-      try {
-        args = JSON.parse(call.function?.arguments ?? '{}');
-      } catch (error) {
-        console.error('Failed to parse tool call arguments', error);
-      }
-      return { name: call.function?.name, arguments: args };
-    });
-    return { text, toolCalls, provider: 'gpt-4o' };
   }
 
   private async getApiKey(candidates: string[]): Promise<string | null> {
@@ -181,20 +177,6 @@ export default class ModelRouter {
       if (value) return value;
     }
     return null;
-  }
-
-  private async safeJsonRequest(url: string, init: RequestInit): Promise<any> {
-    try {
-      const response = await fetch(url, init);
-      if (!response.ok) {
-        console.error('ModelRouter request failed', response.status, response.statusText);
-        return null;
-      }
-      return await response.json();
-    } catch (error) {
-      console.error('ModelRouter request error', error);
-      return null;
-    }
   }
 
   private async digestText(input: string): Promise<string> {
