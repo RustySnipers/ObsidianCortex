@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-cortex",
+  "name": "Obsidian Cortex",
+  "version": "0.0.1",
+  "minAppVersion": "1.5.0",
+  "description": "Agentic Knowledge Management System with secure secret storage and model routing stubs.",
+  "author": "Obsidian Cortex Team",
+  "authorUrl": "https://example.com",
+  "isDesktopOnly": false
+}
