@@ -1,16 +1,13 @@
-import {
-  ModelMessage,
-  ModelRequest,
-  ModelResponse,
-  ToolCall,
-  SecretLoader,
-} from '../types';
+import { ModelMessage, ModelRequest, ModelResponse, ToolCall, SecretLoader } from '../types';
 
 interface GeminiCacheEntry {
   id: string;
   created: number;
   summary: string;
 }
+
+const CLAUDE_PERSONA_PROMPT =
+  'You are Claude 3.5 Sonnet acting as the personal assistant within Obsidian Cortex. Maintain concise, actionable responses and remember context when provided. System prompts are cached for efficiency; do not expose cache details to the user.';
 
 export default class ModelRouter {
   private geminiCache = new Map<string, GeminiCacheEntry>();
@@ -39,6 +36,9 @@ export default class ModelRouter {
       apiKey
     )}`;
     const messages: ModelMessage[] = request.messages ?? [{ role: 'user', content: request.prompt }];
+    if (request.context) {
+      messages.push({ role: 'user', content: `Cached vault context:\n${request.context}` });
+    }
     const payload: Record<string, any> = {
       contents: messages.map((message) => ({ role: message.role, parts: [{ text: message.content }] })),
     };
@@ -66,7 +66,7 @@ export default class ModelRouter {
     const text =
       response?.candidates?.[0]?.content?.parts?.map((part: any) => part?.text).join('\n') ??
       'Gemini did not return a response.';
-    return { text, metadata: { cacheId: cache?.id } };
+    return { text, metadata: { cacheId: cache?.id }, provider: 'gemini-pro' };
   }
 
   private async cacheVaultContext(apiKey: string, context: string): Promise<GeminiCacheEntry | null> {
@@ -97,13 +97,29 @@ export default class ModelRouter {
     if (!apiKey) {
       return { text: 'Anthropic API key is missing. Please store a key labeled "anthropic" or "claude".' };
     }
+    const userMessages = request.messages ?? [{ role: 'user', content: request.prompt }];
+    if (request.context) {
+      userMessages.push({ role: 'user', content: `Context:\n${request.context}` });
+    }
     const body = {
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
-      messages: (request.messages ?? [{ role: 'user', content: request.prompt }]).map((message) => ({
-        role: message.role,
-        content: [{ type: 'text', text: message.content }],
-      })),
+      messages: [
+        {
+          role: 'system',
+          content: [
+            {
+              type: 'text',
+              text: CLAUDE_PERSONA_PROMPT,
+              cache_control: { type: 'ttl', ttl: 60 * 60 * 24 },
+            },
+          ],
+        },
+        ...userMessages.map((message) => ({
+          role: message.role,
+          content: [{ type: 'text', text: message.content }],
+        })),
+      ],
     };
     const response = await this.safeJsonRequest('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -117,7 +133,7 @@ export default class ModelRouter {
       body: JSON.stringify(body),
     });
     const text = response?.content?.[0]?.text ?? 'Claude did not return a response.';
-    return { text, metadata: { cache: 'persona' } };
+    return { text, metadata: { cache: 'persona' }, provider: 'claude-sonnet' };
   }
 
   private async callGpt4o(request: ModelRequest): Promise<ModelResponse> {
@@ -126,6 +142,9 @@ export default class ModelRouter {
       return { text: 'OpenAI API key is missing. Please store it via the secure storage command.' };
     }
     const messages = request.messages ?? [{ role: 'user', content: request.prompt }];
+    if (request.context) {
+      messages.push({ role: 'user', content: `Context:\n${request.context}` });
+    }
     const body: Record<string, any> = {
       model: 'gpt-4o-mini',
       messages,
@@ -153,7 +172,7 @@ export default class ModelRouter {
       }
       return { name: call.function?.name, arguments: args };
     });
-    return { text, toolCalls };
+    return { text, toolCalls, provider: 'gpt-4o' };
   }
 
   private async getApiKey(candidates: string[]): Promise<string | null> {

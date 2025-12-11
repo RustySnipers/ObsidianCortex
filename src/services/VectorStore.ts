@@ -1,5 +1,5 @@
 import { App, Plugin, TAbstractFile, TFile } from 'obsidian';
-import { CortexChunk, SearchResult } from '../types';
+import { CortexChunk, SearchResult, SecretLoader } from '../types';
 
 interface FallbackIndex {
   chunks: Map<string, CortexChunk>;
@@ -11,8 +11,10 @@ export default class VectorStore {
   private embeddings = new Map<string, number[]>();
   private fileBindings = new Map<string, string[]>();
   private chunkCache = new Map<string, CortexChunk>();
+  private transformerPipeline: any | null = null;
+  private loadingLocalTransformer = false;
 
-  constructor(private app: App, private plugin: Plugin) {}
+  constructor(private app: App, private plugin: Plugin, private loadSecret: SecretLoader) {}
 
   async initialize(): Promise<void> {
     await this.ensureDatabase();
@@ -72,7 +74,8 @@ export default class VectorStore {
 
   private async insertChunk(chunk: CortexChunk): Promise<void> {
     if (!this.db) return;
-    this.embeddings.set(chunk.id, this.embed(chunk.content));
+    const embedding = await this.embed(chunk.content);
+    this.embeddings.set(chunk.id, embedding);
     this.chunkCache.set(chunk.id, chunk);
     if (this.orama) {
       await this.orama.insert(this.db, chunk);
@@ -99,7 +102,7 @@ export default class VectorStore {
   async search(query: string, limit = 5): Promise<SearchResult[]> {
     await this.ensureDatabase();
     const bm25Results = await this.bm25Search(query, limit * 2);
-    const vectorResults = this.vectorSearch(query);
+    const vectorResults = await this.vectorSearch(query);
     const combined = new Map<string, SearchResult>();
 
     const maxBm25 = bm25Results.length ? bm25Results[0].score : 1;
@@ -147,8 +150,8 @@ export default class VectorStore {
     return hits.sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
-  private vectorSearch(query: string): SearchResult[] {
-    const queryEmbedding = this.embed(query);
+  private async vectorSearch(query: string): Promise<SearchResult[]> {
+    const queryEmbedding = await this.embed(query);
     const results: SearchResult[] = [];
     for (const [id, embedding] of this.embeddings.entries()) {
       const score = this.cosineSimilarity(queryEmbedding, embedding);
@@ -172,12 +175,14 @@ export default class VectorStore {
     let buffer: string[] = [];
     let currentHeading = 'root';
     let sectionIndex = 0;
+    let blankRowCount = 0;
 
     const flush = () => {
       if (!buffer.length) return;
       const text = buffer.join('\n').trim();
       if (!text) {
         buffer = [];
+        blankRowCount = 0;
         return;
       }
       const id = `${filePath}::${currentHeading}-${sectionIndex}`;
@@ -185,14 +190,25 @@ export default class VectorStore {
       chunks.push({ id, content: text, filePath, blockId });
       sectionIndex += 1;
       buffer = [];
+      blankRowCount = 0;
     };
 
     for (const line of lines) {
-      const headingMatch = /^(#+)\s+(.*)/.exec(line);
+      const headingMatch = /^(#{1,2})\s+(.*)/.exec(line);
+      const isBlank = line.trim().length === 0;
       if (headingMatch) {
         flush();
         currentHeading = this.slugify(headingMatch[2]);
         continue;
+      }
+      if (isBlank) {
+        blankRowCount += 1;
+        if (blankRowCount >= 2) {
+          flush();
+          continue;
+        }
+      } else {
+        blankRowCount = 0;
       }
       buffer.push(line);
     }
@@ -213,17 +229,20 @@ export default class VectorStore {
       .filter(Boolean);
   }
 
-  private embed(text: string): number[] {
-    const tokens = this.tokenize(text);
-    const frequencies = new Map<string, number>();
-    tokens.forEach((token) => frequencies.set(token, (frequencies.get(token) ?? 0) + 1));
-    const vector: number[] = [];
-    const vocab = Array.from(frequencies.keys()).sort();
-    for (const term of vocab) {
-      vector.push(frequencies.get(term) ?? 0);
+  private async embed(text: string): Promise<number[]> {
+    const normalized = text.trim();
+    if (!normalized) return [0];
+    if (this.appIsMobile()) {
+      const mobileVector = await this.embedWithOpenAI(normalized);
+      if (mobileVector) return mobileVector;
+    } else {
+      const local = await this.embedWithLocalTransformers(normalized);
+      if (local) return local;
+      const desktopVector = await this.embedWithOpenAI(normalized);
+      if (desktopVector) return desktopVector;
     }
-    const norm = Math.hypot(...vector) || 1;
-    return vector.map((value) => value / norm);
+
+    return this.simpleFrequencyEmbedding(normalized);
   }
 
   private cosineSimilarity(a: number[], b: number[]): number {
@@ -245,5 +264,82 @@ export default class VectorStore {
       }
     }
     return score;
+  }
+
+  private async embedWithOpenAI(text: string): Promise<number[] | null> {
+    const apiKey = await this.loadSecret('openai');
+    if (!apiKey) return null;
+    try {
+      const response = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'text-embedding-3-small',
+          input: text.slice(0, 7000),
+        }),
+      });
+      if (!response.ok) {
+        console.warn('OpenAI embeddings failed', response.status, response.statusText);
+        return null;
+      }
+      const payload = await response.json();
+      const vector = payload?.data?.[0]?.embedding as number[] | undefined;
+      return Array.isArray(vector) ? vector : null;
+    } catch (error) {
+      console.warn('OpenAI embeddings error', error);
+      return null;
+    }
+  }
+
+  private async embedWithLocalTransformers(text: string): Promise<number[] | null> {
+    if (this.transformerPipeline) {
+      return this.runTransformer(text);
+    }
+    if (this.loadingLocalTransformer) return null;
+    this.loadingLocalTransformer = true;
+    try {
+      const transformers = (window as any).transformers;
+      if (!transformers?.pipeline) return null;
+      this.transformerPipeline = await transformers.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+      return this.runTransformer(text);
+    } catch (error) {
+      console.warn('Local transformer unavailable', error);
+      return null;
+    } finally {
+      this.loadingLocalTransformer = false;
+    }
+  }
+
+  private async runTransformer(text: string): Promise<number[] | null> {
+    if (!this.transformerPipeline) return null;
+    try {
+      const output = await this.transformerPipeline(text, { pooling: 'mean', normalize: true });
+      const data = Array.from(output.data ?? []) as any[];
+      const vector = data.map((value) => Number(value));
+      return vector.length ? vector : null;
+    } catch (error) {
+      console.warn('Transformer embedding failed', error);
+      return null;
+    }
+  }
+
+  private simpleFrequencyEmbedding(text: string): number[] {
+    const tokens = this.tokenize(text);
+    const frequencies = new Map<string, number>();
+    tokens.forEach((token) => frequencies.set(token, (frequencies.get(token) ?? 0) + 1));
+    const vector: number[] = [];
+    const vocab = Array.from(frequencies.keys()).sort();
+    for (const term of vocab) {
+      vector.push(frequencies.get(term) ?? 0);
+    }
+    const norm = Math.hypot(...vector) || 1;
+    return vector.map((value) => value / norm);
+  }
+
+  private appIsMobile(): boolean {
+    return Boolean((this.app as any).isMobile);
   }
 }
