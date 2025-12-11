@@ -1,10 +1,11 @@
-import { App, MarkdownView, TAbstractFile, TFile, TFolder } from 'obsidian';
+import { App, MarkdownView, TFile } from 'obsidian';
+import VectorStore from '../services/VectorStore';
 import { ITool, IToolDefinition, IToolResult } from '../types';
 
 export default class ToolsRegistry {
   private tools: ITool[];
 
-  constructor(private app: App) {
+  constructor(private app: App, private vectorStore?: VectorStore, private allowedCommands: string[] = []) {
     this.tools = [this.createNotesTool(), this.createExecuteCommandTool(), this.createOrganizeNoteTool()];
   }
 
@@ -23,45 +24,37 @@ export default class ToolsRegistry {
   private createNotesTool(): ITool {
     return {
       name: 'notes',
-      description: 'List notes in a folder or read the contents of a specific note.',
+      description: 'Search vault content and return citations for relevant snippets.',
       schema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'read'], description: 'Choose list or read.' },
-          path: { type: 'string', description: "Folder or file path, e.g., 'Projects' or 'Projects/Idea.md'." },
+          query: { type: 'string', description: 'What to look for inside your vault.' },
+          top_k: { type: 'number', description: 'How many results to return.', minimum: 1, maximum: 20 },
         },
-        required: ['action'],
+        required: ['query'],
       },
       handler: async (args: Record<string, any>): Promise<IToolResult> => {
-        const action = (args.action ?? 'list') as 'list' | 'read';
-        const path = String(args.path ?? '').trim();
-        if (action === 'list') {
-          const folder = path ? this.app.vault.getAbstractFileByPath(path) : this.app.vault.getRoot();
-          if (!(folder instanceof TFolder)) {
-            return { name: 'notes', success: false, output: 'Provide a valid folder to list notes.' };
-          }
-          const items = folder.children.filter(
-            (child: TAbstractFile): child is TFile => child instanceof TFile && child.extension === 'md'
-          );
-          const summary = items.map((item: TFile) => item.path).join('\n');
-          return { name: 'notes', success: true, output: summary || 'No markdown files found.' };
+        if (!this.vectorStore) {
+          return { name: 'notes', success: false, output: 'Vector search is unavailable until the index loads.' };
         }
-
-        if (!path) {
-          return { name: 'notes', success: false, output: 'A file path is required to read a note.' };
+        const query = String(args.query ?? '').trim();
+        const topK = Number.isFinite(args.top_k) ? Math.max(1, Math.min(20, Number(args.top_k))) : 6;
+        if (!query) {
+          return { name: 'notes', success: false, output: 'Provide a query to search notes.' };
         }
-        const normalized = path.endsWith('.md') ? path : `${path}.md`;
-        const file = this.app.vault.getAbstractFileByPath(normalized);
-        if (!(file instanceof TFile)) {
-          return { name: 'notes', success: false, output: `No file found at ${normalized}.` };
+        const results = await this.vectorStore.search(query, topK);
+        if (!results.length) {
+          return { name: 'notes', success: true, output: 'No matching notes found.' };
         }
-        try {
-          const content = await this.app.vault.cachedRead(file);
-          return { name: 'notes', success: true, output: content };
-        } catch (error) {
-          console.error('Failed to read note', error);
-          return { name: 'notes', success: false, output: 'Unable to read the note.' };
-        }
+        const formatted = results
+          .map((hit) => {
+            const blockRef = hit.blockRef ?? `^${hit.blockId}`;
+            const cite = `[[${hit.filePath}#${blockRef}]]`;
+            const heading = hit.heading ? `${hit.heading}: ` : '';
+            return `${cite} ${heading}${hit.content}`.trim();
+          })
+          .join('\n\n');
+        return { name: 'notes', success: true, output: formatted };
       },
     };
   }
@@ -93,6 +86,9 @@ export default class ToolsRegistry {
         if (!command) {
           return { name: 'execute_command', success: false, output: `Command ${commandId} not found.` };
         }
+        if (this.allowedCommands.length && !this.allowedCommands.includes(commandId)) {
+          return { name: 'execute_command', success: false, output: 'This command is not allowlisted for automation.' };
+        }
         if (requiresActiveFile) {
           const view = this.app.workspace.getActiveViewOfType(MarkdownView);
           if (!view) {
@@ -117,30 +113,48 @@ export default class ToolsRegistry {
       schema: {
         type: 'object',
         properties: {
-          sourcePath: { type: 'string', description: 'Existing path to the note.' },
-          targetFolder: { type: 'string', description: 'Destination folder for the note.' },
-          newName: { type: 'string', description: 'Optional new file name (without extension).' },
+          filePath: { type: 'string', description: 'Existing path to the note.' },
+          newFolderPath: { type: 'string', description: 'Destination folder for the note.' },
+          newFileName: { type: 'string', description: 'Optional new file name (without extension).' },
+          newHeading: { type: 'string', description: 'Replace the first heading in the note.' },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional list of tags to ensure in the frontmatter.',
+          },
         },
-        required: ['sourcePath', 'targetFolder'],
+        required: ['filePath'],
       },
       handler: async (args: Record<string, any>): Promise<IToolResult> => {
-        const sourcePath = String(args.sourcePath ?? '').trim();
-        const targetFolder = String(args.targetFolder ?? '').trim();
-        const newName = String(args.newName ?? '').trim();
-        if (!sourcePath || !targetFolder) {
-          return { name: 'organize_note', success: false, output: 'Both sourcePath and targetFolder are required.' };
+        const sourcePath = String(args.filePath ?? '').trim();
+        const targetFolder = String(args.newFolderPath ?? '').trim();
+        const newFileName = String(args.newFileName ?? '').trim();
+        const newHeading = String(args.newHeading ?? '').trim();
+        const tags = Array.isArray(args.tags) ? args.tags.map((tag: any) => String(tag).trim()).filter(Boolean) : [];
+        if (!sourcePath) {
+          return { name: 'organize_note', success: false, output: 'filePath is required.' };
         }
         const file = this.app.vault.getAbstractFileByPath(sourcePath);
         if (!(file instanceof TFile)) {
           return { name: 'organize_note', success: false, output: `No file found at ${sourcePath}.` };
         }
-        const destinationFolder = targetFolder.replace(/\/$/, '');
-        const fileName = newName || file.name.replace(/\.md$/, '');
-        const normalized = `${destinationFolder}/${fileName.endsWith('.md') ? fileName : `${fileName}.md`}`;
+        const currentFolder = file.path.includes('/') ? file.path.split('/').slice(0, -1).join('/') : '';
+        const destinationFolder = targetFolder ? targetFolder.replace(/\/$/, '') : currentFolder;
+        const fileName = newFileName || file.name.replace(/\.md$/, '');
+        const normalized = destinationFolder
+          ? `${destinationFolder}/${fileName.endsWith('.md') ? fileName : `${fileName}.md`}`
+          : file.path;
         try {
-          await this.ensureFolders(destinationFolder);
-          await this.app.fileManager.renameFile(file, normalized);
-          return { name: 'organize_note', success: true, output: `Moved note to ${normalized}.` };
+          if (destinationFolder) {
+            await this.ensureFolders(destinationFolder);
+          }
+          if (newHeading || tags.length) {
+            await this.app.vault.process(file, (data: string) => this.applyNoteUpdates(data, newHeading, tags));
+          }
+          if (normalized !== file.path) {
+            await this.app.fileManager.renameFile(file, normalized);
+          }
+          return { name: 'organize_note', success: true, output: `Note updated${normalized ? ` at ${normalized}` : ''}.` };
         } catch (error) {
           console.error('Failed to organize note', error);
           return { name: 'organize_note', success: false, output: 'Unable to move or rename the note.' };
@@ -160,5 +174,39 @@ export default class ToolsRegistry {
         await this.app.vault.createFolder(current);
       }
     }
+  }
+
+  private applyNoteUpdates(content: string, newHeading: string, tags: string[]): string {
+    let updated = content;
+    if (newHeading) {
+      const lines = updated.split(/\r?\n/);
+      const firstHeadingIndex = lines.findIndex((line) => /^#\s+/.test(line));
+      if (firstHeadingIndex >= 0) {
+        lines[firstHeadingIndex] = `# ${newHeading}`;
+      } else {
+        lines.unshift(`# ${newHeading}`);
+      }
+      updated = lines.join('\n');
+    }
+
+    if (tags.length) {
+      const tagLine = `tags: [${tags.join(', ')}]`;
+      if (updated.startsWith('---')) {
+        const end = updated.indexOf('\n---', 3);
+        if (end !== -1) {
+          const header = updated.slice(0, end);
+          const body = updated.slice(end);
+          const existingTagLine = /tags:\s*\[[^\]]*\]/;
+          const newHeader = existingTagLine.test(header)
+            ? header.replace(existingTagLine, tagLine)
+            : `${header}\n${tagLine}`;
+          updated = `${newHeader}${body}`;
+        }
+      } else {
+        updated = `---\n${tagLine}\n---\n${updated}`;
+      }
+    }
+
+    return updated;
   }
 }

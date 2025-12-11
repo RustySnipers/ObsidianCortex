@@ -7,7 +7,9 @@ interface IndexedChunk {
   id: string;
   content: string;
   filePath: string;
+  heading: string;
   blockId: string;
+  blockRef: string;
   embedding: number[];
   keywords: string[];
 }
@@ -97,27 +99,41 @@ export default class VectorStore {
     const vectorResults = await this.vectorSearch(query, limit * 2);
     const combined = new Map<string, VectorSearchResult>();
 
-    const maxBm25 = bm25Results.length ? bm25Results[0].score : 1;
-    const maxVector = vectorResults.length ? vectorResults[0].score : 1;
+    const maxBm25 = bm25Results.length ? bm25Results[0].keywordScore ?? bm25Results[0].combinedScore : 1;
+    const maxVector = vectorResults.length ? vectorResults[0].vectorScore ?? vectorResults[0].combinedScore : 1;
 
     for (const result of bm25Results) {
-      const normalized = maxBm25 ? result.score / maxBm25 : 0;
-      combined.set(result.blockId, { ...result, score: normalized * keywordWeight });
+      const normalized = maxBm25 ? (result.keywordScore ?? 0) / maxBm25 : 0;
+      combined.set(result.blockId, {
+        ...result,
+        keywordScore: normalized,
+        vectorScore: 0,
+        combinedScore: normalized * keywordWeight,
+        score: normalized * keywordWeight,
+      });
     }
 
     for (const result of vectorResults) {
-      const normalized = maxVector ? result.score / maxVector : 0;
+      const normalized = maxVector ? (result.vectorScore ?? 0) / maxVector : 0;
       const weighted = normalized * vectorWeight;
       const existing = combined.get(result.blockId);
       if (existing) {
-        existing.score += weighted;
+        existing.vectorScore = normalized;
+        existing.combinedScore = (existing.keywordScore ?? 0) * keywordWeight + weighted;
+        existing.score = existing.combinedScore;
       } else {
-        combined.set(result.blockId, { ...result, score: weighted });
+        combined.set(result.blockId, {
+          ...result,
+          keywordScore: 0,
+          vectorScore: normalized,
+          combinedScore: weighted,
+          score: weighted,
+        });
       }
     }
 
     return Array.from(combined.values())
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => (b.combinedScore ?? 0) - (a.combinedScore ?? 0))
       .slice(0, limit);
   }
 
@@ -156,7 +172,9 @@ export default class VectorStore {
           id: 'string',
           content: 'string',
           filePath: 'string',
+          heading: 'string',
           blockId: 'string',
+          blockRef: 'string',
           keywords: 'string[]',
         },
       });
@@ -206,13 +224,16 @@ export default class VectorStore {
         const slice = tokens.slice(cursor, cursor + chunkSize);
         const text = slice.join(' ');
         const blockId = this.createBlockId(filePath, section.heading, globalIndex++);
+        const blockRef = `^${blockId}`;
         const embedding = this.simpleHashEmbedding(text);
         const keywords = this.extractKeywords(text);
         chunks.push({
           id: `${filePath}::${blockId}`,
           content: text,
           filePath,
+          heading: section.heading,
           blockId,
+          blockRef,
           embedding,
           keywords,
         });
@@ -275,7 +296,10 @@ export default class VectorStore {
         content: hit.document.content,
         filePath: hit.document.filePath,
         blockId: hit.document.blockId,
-        score: hit.score,
+        heading: hit.document.heading,
+        blockRef: hit.document.blockRef,
+        keywordScore: hit.score,
+        combinedScore: hit.score,
       }));
     }
     const tokens = this.tokenize(query);
@@ -283,10 +307,18 @@ export default class VectorStore {
     for (const chunk of this.cachedChunks.values()) {
       const score = this.simpleMatchScore(chunk.content, tokens);
       if (score > 0) {
-        matches.push({ content: chunk.content, filePath: chunk.filePath, blockId: chunk.blockId, score });
+        matches.push({
+          content: chunk.content,
+          filePath: chunk.filePath,
+          blockId: chunk.blockId,
+          heading: chunk.heading,
+          blockRef: chunk.blockRef,
+          keywordScore: score,
+          combinedScore: score,
+        });
       }
     }
-    return matches.sort((a, b) => b.score - a.score).slice(0, limit);
+    return matches.sort((a, b) => b.combinedScore - a.combinedScore).slice(0, limit);
   }
 
   private async vectorSearch(query: string, limit: number): Promise<VectorSearchResult[]> {
@@ -294,9 +326,17 @@ export default class VectorStore {
     const results: VectorSearchResult[] = [];
     for (const chunk of this.cachedChunks.values()) {
       const score = this.cosineSimilarity(embedding, chunk.embedding);
-      results.push({ content: chunk.content, filePath: chunk.filePath, blockId: chunk.blockId, score });
+      results.push({
+        content: chunk.content,
+        filePath: chunk.filePath,
+        blockId: chunk.blockId,
+        heading: chunk.heading,
+        blockRef: chunk.blockRef,
+        vectorScore: score,
+        combinedScore: score,
+      });
     }
-    return results.sort((a, b) => b.score - a.score).slice(0, limit);
+    return results.sort((a, b) => b.combinedScore - a.combinedScore).slice(0, limit);
   }
 
   private tokenize(text: string): string[] {

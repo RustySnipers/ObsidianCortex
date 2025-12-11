@@ -11,17 +11,28 @@ interface GeminiCacheEntry {
   created: number;
 }
 
+interface ClaudeCacheEntry {
+  response: ModelRouterResponse;
+  created: number;
+}
+
+const DEFAULT_CLAUDE_CACHE_TTL = 5 * 60 * 1000;
+const DEFAULT_GEMINI_CACHE_TTL = 30 * 60 * 1000;
+
 const CLAUDE_PERSONA_PROMPT =
   'You are Claude 3.5 Sonnet acting as the personal assistant within Obsidian Cortex. Use concise, actionable responses and respect vault citations when provided. System prompts are cacheable; do not expose cache details to the user.';
 
 export default class ModelRouter {
   private geminiCache = new Map<string, GeminiCacheEntry>();
-  private claudePromptCache = new Map<string, ModelRouterResponse>();
+  private claudePromptCache = new Map<string, ClaudeCacheEntry>();
   private openaiClient: any | null = null;
   private anthropicClient: any | null = null;
   private geminiClient: any | null = null;
 
-  constructor(private loadSecret: SecretLoader) {}
+  constructor(
+    private loadSecret: SecretLoader,
+    private config: { claudePromptCacheTtlMs?: number; geminiContextCacheTtlMs?: number } = {}
+  ) {}
 
   async route(
     task: TaskType,
@@ -87,7 +98,7 @@ export default class ModelRouter {
     }
     const promptHash = await this.digestText(`${JSON.stringify(messages)}::${context}`);
     const cached = this.claudePromptCache.get(promptHash);
-    if (cached) return cached;
+    if (cached && Date.now() - cached.created < this.getClaudeCacheTtl()) return cached.response;
 
     const client = this.getAnthropicClient(apiKey);
     const combinedMessages = [
@@ -114,7 +125,7 @@ export default class ModelRouter {
     });
     const text = completion.content?.[0]?.text ?? 'Claude did not return a response.';
     const response: ModelRouterResponse = { text, metadata: { cache: 'prompt', cacheKey: promptHash }, provider: 'claude' };
-    this.claudePromptCache.set(promptHash, response);
+    this.claudePromptCache.set(promptHash, { response, created: Date.now() });
     return response;
   }
 
@@ -181,7 +192,9 @@ export default class ModelRouter {
     if (!context) return null;
     const digest = await this.digestText(context);
     const existing = this.geminiCache.get(digest);
-    if (existing) return existing;
+    if (existing && Date.now() - existing.created < this.getGeminiCacheTtl()) return existing;
+
+    this.geminiCache.delete(digest);
 
     const url = `https://generativelanguage.googleapis.com/v1beta/cachedContents?key=${encodeURIComponent(apiKey)}`;
     const payload = {
@@ -197,11 +210,21 @@ export default class ModelRouter {
       if (!response.ok) return null;
       const data = await response.json();
       const entry: GeminiCacheEntry = { id: data?.name, digest, created: Date.now() };
+      this.pruneGeminiCache();
       this.geminiCache.set(digest, entry);
       return entry;
     } catch (error) {
       console.error('Failed to cache Gemini context', error);
       return null;
+    }
+  }
+
+  private pruneGeminiCache(): void {
+    const maxEntries = 10;
+    if (this.geminiCache.size < maxEntries) return;
+    const oldest = Array.from(this.geminiCache.values()).sort((a, b) => a.created - b.created)[0];
+    if (oldest) {
+      this.geminiCache.delete(oldest.digest);
     }
   }
 
@@ -220,5 +243,13 @@ export default class ModelRouter {
     return Array.from(new Uint8Array(hash))
       .map((byte) => byte.toString(16).padStart(2, '0'))
       .join('');
+  }
+
+  private getClaudeCacheTtl(): number {
+    return this.config.claudePromptCacheTtlMs ?? DEFAULT_CLAUDE_CACHE_TTL;
+  }
+
+  private getGeminiCacheTtl(): number {
+    return this.config.geminiContextCacheTtlMs ?? DEFAULT_GEMINI_CACHE_TTL;
   }
 }
